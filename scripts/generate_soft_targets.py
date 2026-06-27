@@ -128,7 +128,11 @@ def main():
         
         # Generate predictions for this partition
         with torch.no_grad():
-            part_preds = teacher.predict(part_loader, mode="prediction")
+            part_preds = teacher.predict(
+                part_loader,
+                mode="prediction",
+                trainer_kwargs={"strategy": "single_device", "devices": 1}
+            )
             
         # Limit predictions in debug mode
         max_batches_per_store = getattr(cfg.environment, "max_batches_per_store", None)

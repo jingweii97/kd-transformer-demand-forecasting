@@ -39,7 +39,11 @@ def get_predictions(model, loader):
     """
     # For TFT Teacher, use PyTorch Forecasting's built-in predict method
     if isinstance(model, TemporalFusionTransformer):
-        preds = model.predict(loader, mode="prediction")
+        preds = model.predict(
+            loader,
+            mode="prediction",
+            trainer_kwargs={"strategy": "single_device", "devices": 1}
+        )
         return preds.cpu().numpy()
         
     # For custom Student models, run standard batch evaluation
