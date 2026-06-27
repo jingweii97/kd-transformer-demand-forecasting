@@ -1,5 +1,5 @@
 from pytorch_forecasting import TimeSeriesDataSet, GroupNormalizer
-
+import psutil, os
 def build_timeseries_dataset(df, cfg, is_train=True, training_dataset=None, max_idx=None):
     """
     Constructs PyTorch Forecasting TimeSeriesDataSet using configuration settings.
@@ -17,9 +17,16 @@ def build_timeseries_dataset(df, cfg, is_train=True, training_dataset=None, max_
     if is_train:
         # Slices training data strictly up to the end of the Training window
         train_end = cfg.dataset.splits.train.end
+
+        process = psutil.Process(os.getpid())
+        print(f"Original df: {df.memory_usage(deep=True).sum()/1024**3:.2f} GB")
+        print(f"RSS: {process.memory_info().rss/1024**3:.2f} GB")
         df_train = df[df['time_idx'] <= train_end].copy()
-        
-        return TimeSeriesDataSet(
+        print(f"After train slice RSS: {process.memory_info().rss/1024**3:.2f} GB")
+
+        print("Constructing TimeSeriesDataSet...")
+
+        training_dataset = TimeSeriesDataSet(
             df_train,
             time_idx="time_idx",
             target=cfg.dataset.target,
@@ -37,6 +44,10 @@ def build_timeseries_dataset(df, cfg, is_train=True, training_dataset=None, max_
             add_target_scales=True,
             add_encoder_length=True,
         )
+
+        print(f"After TimeSeriesDataSet RSS: {process.memory_info().rss/1024**3:.2f} GB")
+        return training_dataset
+
     else:
         assert training_dataset is not None, "training_dataset must be provided to inherit parameters."
         assert max_idx is not None, "max_idx (end day of the evaluation split) must be provided."
