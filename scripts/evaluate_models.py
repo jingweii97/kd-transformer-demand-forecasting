@@ -13,7 +13,7 @@ import time
 from utils.config import load_config, save_config, save_metadata
 from utils.paths import resolve_path
 from utils.seed import set_seed
-from data.cache import load_from_cache
+from data.cache import load_from_cache, load_all_from_cache
 from data.dataset import build_timeseries_dataset
 from models.student import M5TransformerStudent
 
@@ -252,13 +252,17 @@ def main():
             raise FileNotFoundError(f"{path_name} not found at: {path}")
 
     # 2. Load Preprocessed Data
-    df = load_from_cache(
-        artifacts_dir=cfg.environment.artifacts_dir,
-        store_filter=cfg.environment.store_filter
-    )
+    if cfg.environment.store_filter:
+        df = load_from_cache(
+            artifacts_dir=cfg.environment.artifacts_dir,
+            store_filter=cfg.environment.store_filter
+        )
+    else:
+        df = load_all_from_cache(artifacts_dir=cfg.environment.artifacts_dir)
+        
     if df is None:
         raise FileNotFoundError(
-            f"Preprocessed cache not found for store filter: {cfg.environment.store_filter}. "
+            f"Preprocessed cache not found for store filter: '{cfg.environment.store_filter}'. "
             "Please run prepare_dataset.py first."
         )
 
