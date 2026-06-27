@@ -164,7 +164,7 @@ class StoreMetadataBuilder:
         for col in cat_cols:
             sorted_vals = sorted(list(unique_vals[col]))
             encoder = NaNLabelEncoder(add_nan=True)
-            encoder.fit(sorted_vals)
+            encoder.fit(np.array(sorted_vals, dtype=object))
             self.categorical_encoders[col] = encoder
             
         del df_sales_meta
