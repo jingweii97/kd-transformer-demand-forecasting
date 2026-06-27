@@ -18,7 +18,8 @@ from models.teacher import create_tft_teacher
 def main():
     parser = argparse.ArgumentParser(description="Train TFT Teacher Model on M5 Dataset")
     parser.add_argument("--env", type=str, default="local", help="Environment configuration name")
-    parser.add_argument("--exp-name", type=str, default="exp_001", help="Experiment name directory")
+    parser.add_argument("--exp-name", type=str, default=None,
+                        help="Experiment name directory (required — e.g. exp_full_phase1)")
     
     # Overrides
     parser.add_argument("--epochs", type=int, default=None, help="Override training epochs")
@@ -28,6 +29,14 @@ def main():
     parser.add_argument("--max-stores", type=int, default=None, help="Limit maximum number of store partitions to stream")
     parser.add_argument("--max-batches-per-store", type=int, default=None, help="Limit maximum batches per store partition")
     args = parser.parse_args()
+
+    # B-4: Require an explicit experiment name to avoid accidentally overwriting
+    # existing artifacts (e.g. the pre-existing exp_001 checkpoints).
+    if args.exp_name is None:
+        raise ValueError(
+            "--exp-name is required. Provide a descriptive name for this run, "
+            "e.g. --exp-name exp_full_phase1"
+        )
 
     # 1. Load Configurations
     cfg = load_config(env_name=args.env)
@@ -50,13 +59,15 @@ def main():
     # 2. Load cached Parquet dataset
     # Single store (local dev / Phase-1): use store_filter directly.
     # Full dataset (Phase-2, store_filter empty): concatenate all per-store Parquet files.
+    from utils.paths import get_dataset_dir
+    ds_dir = get_dataset_dir(cfg)
     if cfg.environment.store_filter:
         df = load_from_cache(
-            artifacts_dir=cfg.environment.artifacts_dir,
+            artifacts_dir=ds_dir,
             store_filter=cfg.environment.store_filter
         )
     else:
-        df = load_all_from_cache(artifacts_dir=cfg.environment.artifacts_dir)
+        df = load_all_from_cache(artifacts_dir=ds_dir)
     if df is None:
         raise FileNotFoundError(
             f"Preprocessed cache not found for store filter: '{cfg.environment.store_filter}'. "

@@ -2,6 +2,8 @@
 
 input_dir: "input"
 artifacts_dir: "artifacts"
+dataset_artifacts_dir: "artifacts"
+experiment_artifacts_dir: "artifacts"
 outputs_dir: "outputs"
 
 store_filter: ""  # Empty means full dataset (30,490 series)

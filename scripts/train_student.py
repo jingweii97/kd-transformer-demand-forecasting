@@ -19,7 +19,8 @@ from models.student import M5TransformerStudent
 def main():
     parser = argparse.ArgumentParser(description="Train Compact Transformer Student Model on M5 Dataset")
     parser.add_argument("--env", type=str, default="local", help="Environment configuration name")
-    parser.add_argument("--exp-name", type=str, default="exp_001", help="Experiment name directory")
+    parser.add_argument("--exp-name", type=str, default=None,
+                        help="Experiment name directory (required — e.g. exp_full_phase1)")
     
     # Overrides
     parser.add_argument("--kd", action="store_true", help="Enable teacher-student Knowledge Distillation (KD)")
@@ -36,6 +37,14 @@ def main():
     parser.add_argument("--max-stores", type=int, default=None, help="Limit maximum number of store partitions to stream")
     parser.add_argument("--max-batches-per-store", type=int, default=None, help="Limit maximum batches per store partition")
     args = parser.parse_args()
+
+    # B-4: Require an explicit experiment name to avoid accidentally overwriting
+    # existing artifacts (e.g. the pre-existing exp_001 checkpoints).
+    if args.exp_name is None:
+        raise ValueError(
+            "--exp-name is required. Provide a descriptive name for this run, "
+            "e.g. --exp-name exp_full_phase1"
+        )
 
     # 1. Load Configurations
     cfg = load_config(env_name=args.env)
@@ -60,13 +69,15 @@ def main():
     # 2. Load Preprocessed Data
     # Single store (local dev / Phase-1): use store_filter directly.
     # Full dataset (Phase-2, store_filter empty): concatenate all per-store Parquet files.
+    from utils.paths import get_dataset_dir
+    ds_dir = get_dataset_dir(cfg)
     if cfg.environment.store_filter:
         df = load_from_cache(
-            artifacts_dir=cfg.environment.artifacts_dir,
+            artifacts_dir=ds_dir,
             store_filter=cfg.environment.store_filter
         )
     else:
-        df = load_all_from_cache(artifacts_dir=cfg.environment.artifacts_dir)
+        df = load_all_from_cache(artifacts_dir=ds_dir)
     if df is None:
         raise FileNotFoundError(
             f"Preprocessed cache not found for store filter: '{cfg.environment.store_filter}'. "
@@ -92,9 +103,23 @@ def main():
     if kd_enabled:
         soft_targets_path = args.soft_targets_path
         if not soft_targets_path:
-            # Try to load from artifacts/soft_targets/<exp_name>.pt by default
-            artifacts_dir = resolve_path(cfg.environment.artifacts_dir)
-            soft_targets_path = os.path.join(artifacts_dir, "soft_targets", f"{args.exp_name}.pt")
+            exp_dir = getattr(cfg.environment, "experiment_artifacts_dir", None)
+            if exp_dir is not None:
+                from utils.paths import get_experiment_dir
+                exp_art_dir = get_experiment_dir(cfg)
+                path1 = os.path.join(exp_art_dir, "soft_targets", f"{args.exp_name}.pt")
+                path2 = os.path.join(exp_art_dir, "outputs", "soft_targets", f"{args.exp_name}.pt")
+                if os.path.exists(path1):
+                    soft_targets_path = path1
+                elif os.path.exists(path2):
+                    soft_targets_path = path2
+                else:
+                    raise FileNotFoundError(
+                        f"Soft targets file for '{args.exp_name}' not found under configured experiment_artifacts_dir at '{exp_art_dir}'"
+                    )
+            else:
+                artifacts_dir = resolve_path(cfg.environment.artifacts_dir)
+                soft_targets_path = os.path.join(artifacts_dir, "soft_targets", f"{args.exp_name}.pt")
             
         soft_targets_path_abs = resolve_path(soft_targets_path)
         print(f"Loading pre-computed teacher forecasts from: {soft_targets_path_abs}")
@@ -106,6 +131,23 @@ def main():
         
         soft_targets = torch.load(soft_targets_path_abs)
         print(f"Loaded soft targets tensor of shape: {soft_targets.shape}")
+
+        # A-3: Validate tensor dimensions against the fitted dataset and config.
+        # Catches scope mismatches (e.g. single-store .pt loaded for a full run)
+        # before training starts rather than silently producing wrong gradients.
+        expected_groups = len(training_data._categorical_encoders['id'].classes_)
+        if soft_targets.shape[0] != expected_groups:
+            raise RuntimeError(
+                f"Soft targets group dimension ({soft_targets.shape[0]}) does not "
+                f"match the expected number of series ({expected_groups}). "
+                "The file may have been generated for a different dataset scope "
+                "(e.g. single-store vs full dataset). Re-run generate_soft_targets.py."
+            )
+        if soft_targets.shape[2] != cfg.dataset.prediction_window:
+            raise RuntimeError(
+                f"Soft targets horizon dimension ({soft_targets.shape[2]}) does not "
+                f"match the configured prediction_window ({cfg.dataset.prediction_window})."
+            )
 
     # 6. Instantiate Student Model
     print("Instantiating Compact Transformer Student model...")
@@ -147,7 +189,7 @@ def main():
     
     early_stop_callback = EarlyStopping(
         monitor="val_loss",
-        patience=5,
+        patience=cfg.student.patience,
         min_delta=1e-4,
         mode="min"
     )

@@ -96,20 +96,34 @@ def save_to_cache(df, artifacts_dir, store_filter):
 def load_from_cache(artifacts_dir, store_filter):
     """
     Loads preprocessed DataFrame from Parquet cache for a single store.
-    Returns None if the cache does not exist.
+    Returns None if the cache file does not exist.
+    Raises RuntimeError if the cache exists but its feature version is stale.
     """
     cache_path = get_cache_path(artifacts_dir, store_filter)
-    if os.path.exists(cache_path):
-        print(f"Loading preprocessed dataset from: {cache_path}")
-        df = pd.read_parquet(cache_path, engine='pyarrow')
-        # Re-convert to pandas category type (Parquet round-trip may lose this)
-        cat_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id',
-                    'weekday', 'month', 'year', 'event_name_1', 'event_type_1']
-        for col in cat_cols:
-            if col in df.columns:
-                df[col] = df[col].astype('category')
-        return df
-    return None
+    if not os.path.exists(cache_path):
+        return None
+    # Guard: never silently load a cache produced by a different feature_version.
+    if not is_cache_valid(artifacts_dir, store_filter):
+        version_path = _get_version_path(artifacts_dir, store_filter)
+        stored_version = "missing"
+        if os.path.exists(version_path):
+            with open(version_path) as _vf:
+                stored_version = _vf.read().strip()
+        raise RuntimeError(
+            f"Cache for store '{store_filter or 'full'}' is stale and cannot be loaded.\n"
+            f"  Stored feature_version : {stored_version}\n"
+            f"  Expected feature_version: {FEATURE_VERSION}\n"
+            "Run prepare_dataset.py to regenerate the cache."
+        )
+    print(f"Loading preprocessed dataset from: {cache_path}")
+    df = pd.read_parquet(cache_path, engine='pyarrow')
+    # Re-convert to pandas category type (Parquet round-trip may lose this)
+    cat_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id',
+                'weekday', 'month', 'year', 'event_name_1', 'event_type_1']
+    for col in cat_cols:
+        if col in df.columns:
+            df[col] = df[col].astype('category')
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +151,28 @@ def load_all_from_cache(artifacts_dir):
     files = sorted(glob.glob(os.path.join(cache_dir, "preprocessed_*.parquet")))
     if not files:
         return None
+
+    # Guard: validate every version sidecar before loading any data.
+    # A single stale file in a multi-store run would corrupt the concatenated
+    # DataFrame; checking all upfront produces a clear, actionable error.
+    stale_files = []
+    for _f in files:
+        _version_path = os.path.splitext(_f)[0] + ".version"
+        if not os.path.exists(_version_path):
+            stale_files.append(f"{os.path.basename(_f)}: missing version sidecar")
+            continue
+        with open(_version_path) as _vf:
+            _stored = int(_vf.read().strip())
+        if _stored != FEATURE_VERSION:
+            stale_files.append(
+                f"{os.path.basename(_f)}: version {_stored} != expected {FEATURE_VERSION}"
+            )
+    if stale_files:
+        _details = "\n  ".join(stale_files)
+        raise RuntimeError(
+            f"Stale or missing version sidecars detected:\n  {_details}\n"
+            "Run prepare_dataset.py to regenerate stale caches."
+        )
 
     print(f"Loading {len(files)} store Parquet file(s)...")
     dfs = [pd.read_parquet(f, engine='pyarrow') for f in files]

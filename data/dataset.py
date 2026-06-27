@@ -28,8 +28,9 @@ class StorePartitionedDataset(IterableDataset):
 
     def __iter__(self):
         import gc
+        from utils.paths import get_dataset_dir
         train_end = self.cfg.dataset.splits.train.end
-        artifacts_dir = self.cfg.environment.artifacts_dir
+        artifacts_dir = get_dataset_dir(self.cfg)
         
         # Expose debug parameters
         max_stores = getattr(self.cfg.environment, "max_stores", None)
@@ -97,11 +98,15 @@ class StorePartitionedDataset(IterableDataset):
                 decoded_indices.append(part_ds.decoded_index)
             
             # Create partition-level DataLoader
+            # num_workers comes from cfg so the value is environment-appropriate
+            # (0 = local/Windows, 2 = Kaggle, 4 = DICC). The outer DataLoader
+            # wrappers in StorePartitionManager intentionally keep num_workers=0
+            # because wrapping an IterableDataset with workers > 0 duplicates data.
             part_loader = part_ds.to_dataloader(
-                train=self.is_train, 
-                batch_size=self.batch_size, 
-                shuffle=self.is_train, 
-                num_workers=0
+                train=self.is_train,
+                batch_size=self.batch_size,
+                shuffle=self.is_train,
+                num_workers=self.cfg.environment.num_workers
             )
             
             # Yield batches directly
@@ -177,7 +182,8 @@ class StoreMetadataBuilder:
         target_col = self.cfg.dataset.target
         train_end = self.cfg.dataset.splits.train.end
         
-        artifacts_dir = resolve_path(self.cfg.environment.artifacts_dir)
+        from utils.paths import get_dataset_dir
+        artifacts_dir = get_dataset_dir(self.cfg)
         cache_dir = os.path.join(artifacts_dir, "data")
         files = sorted(glob.glob(os.path.join(cache_dir, "preprocessed_*.parquet")))
         if not files:
@@ -290,26 +296,24 @@ def build_timeseries_dataset(df, cfg, is_train=True, training_dataset=None, max_
     For evaluation: slices df and uses TimeSeriesDataSet.from_dataset (for backwards compatibility).
     """
     if is_train:
-        metadata_path = resolve_path(os.path.join(cfg.environment.artifacts_dir, "metadata", "global_metadata.pkl"))
-        if os.path.exists(metadata_path):
-            print(f"Loading global metadata builder from cache: {metadata_path}")
-            with open(metadata_path, 'rb') as f:
-                builder = pickle.load(f)
-            # Rebind configuration
-            builder.cfg = cfg
-            builder.base_dataset.cfg = cfg
-            return builder.base_dataset
+        from utils.paths import get_dataset_dir
+        dataset_dir = get_dataset_dir(cfg)
+        metadata_path = os.path.join(dataset_dir, "metadata", "global_metadata.pkl")
         
-        # Fit global metadata
-        builder = StoreMetadataBuilder(cfg)
-        builder.fit()
-        
-        # Save cache
-        os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
-        print(f"Saving global metadata builder to cache: {metadata_path}")
-        with open(metadata_path, 'wb') as f:
-            pickle.dump(builder, f)
+        if not os.path.exists(metadata_path):
+            raise FileNotFoundError(
+                f"Global metadata cache file not found at: '{metadata_path}'. "
+                "Ensure prepare_dataset.py has been run to generate the cache and metadata "
+                "before starting model training."
+            )
             
+        print(f"Loading global metadata builder from cache: {metadata_path}")
+        with open(metadata_path, 'rb') as f:
+            builder = pickle.load(f)
+            
+        # Rebind configuration
+        builder.cfg = cfg
+        builder.base_dataset.cfg = cfg
         return builder.base_dataset
     else:
         assert training_dataset is not None, "training_dataset must be provided."

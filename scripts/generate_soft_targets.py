@@ -1,16 +1,18 @@
 import os
 import sys
+import json
 import argparse
+import datetime
 import torch
 import numpy as np
 
 # Add repository root to python path to allow importing packages
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.config import load_config
+from utils.config import load_config, get_git_commit_hash
 from utils.paths import resolve_path
 from utils.seed import set_seed
-from data.cache import load_from_cache, load_all_from_cache
+from data.cache import load_from_cache, load_all_from_cache, FEATURE_VERSION
 from data.dataset import build_timeseries_dataset
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 
@@ -18,11 +20,19 @@ def main():
     parser = argparse.ArgumentParser(description="Generate and Save TFT Teacher Forecasts as Soft Targets")
     parser.add_argument("--env", type=str, default="local", help="Environment configuration name")
     parser.add_argument("--checkpoint-path", type=str, required=True, help="Path to the trained TFT teacher checkpoint")
-    parser.add_argument("--exp-name", type=str, default="exp_001", help="Experiment name")
+    parser.add_argument("--exp-name", type=str, default=None,
+                        help="Experiment name (required — e.g. exp_full_phase1)")
     parser.add_argument("--batch-size", type=int, default=256, help="Inference batch size")
     parser.add_argument("--max-day", type=int, default=None, 
                         help="Limit inference day range for fast verification (default: end of Validation)")
     args = parser.parse_args()
+
+    # B-4: Require an explicit experiment name.
+    if args.exp_name is None:
+        raise ValueError(
+            "--exp-name is required. Provide a descriptive name for this run, "
+            "e.g. --exp-name exp_full_phase1"
+        )
 
     # Load Configurations
     cfg = load_config(env_name=args.env)
@@ -40,13 +50,15 @@ def main():
     # 1. Load Preprocessed Data
     # Single store (local dev / Phase-1): use store_filter directly.
     # Full dataset (Phase-2, store_filter empty): concatenate all per-store Parquet files.
+    from utils.paths import get_dataset_dir
+    ds_dir = get_dataset_dir(cfg)
     if cfg.environment.store_filter:
         df = load_from_cache(
-            artifacts_dir=cfg.environment.artifacts_dir,
+            artifacts_dir=ds_dir,
             store_filter=cfg.environment.store_filter
         )
     else:
-        df = load_all_from_cache(artifacts_dir=cfg.environment.artifacts_dir)
+        df = load_all_from_cache(artifacts_dir=ds_dir)
     if df is None:
         raise FileNotFoundError(
             f"Preprocessed cache not found for store filter: '{cfg.environment.store_filter}'. "
@@ -80,7 +92,7 @@ def main():
         
     max_encoder_length = cfg.dataset.lookback_window
     max_prediction_length = cfg.dataset.prediction_window
-    min_idx = max_day - max_encoder_length - max_prediction_length + 1
+    min_idx = 1
     
     all_preds = []
     all_group_names = []
@@ -123,7 +135,7 @@ def main():
             train=False,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=0
+            num_workers=cfg.environment.num_workers
         )
         
         # Generate predictions for this partition
@@ -178,9 +190,29 @@ def main():
     
     soft_targets[group_codes_tensor, start_times_tensor] = preds.cpu()
 
-    # 8. Save soft targets
+    # 8. Save soft targets tensor
     print(f"Saving soft targets lookup tensor to: {output_file}")
     torch.save(soft_targets, output_file)
+
+    # A-3: Save a JSON provenance sidecar alongside the .pt so that the tensor's
+    # origin (checkpoint, scope, feature version, generation parameters) is always
+    # traceable without inspecting tensor contents.
+    provenance = {
+        "exp_name": args.exp_name,
+        "checkpoint_path": str(checkpoint_path_abs),
+        "store_filter": store_filter or "full",
+        "max_day": int(max_day),
+        "batch_size": int(args.batch_size),
+        "feature_version": int(FEATURE_VERSION),
+        "tensor_shape": list(soft_targets.shape),
+        "git_commit": get_git_commit_hash(),
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    }
+    provenance_path = output_file.replace(".pt", ".json")
+    print(f"Saving soft targets provenance to: {provenance_path}")
+    with open(provenance_path, "w") as _pf:
+        json.dump(provenance, _pf, indent=4)
+
     print("Soft targets generation completed successfully!")
 
 if __name__ == "__main__":

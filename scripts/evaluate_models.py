@@ -211,13 +211,25 @@ def compute_mase(actuals_slice, forecasts_slice, scales_array):
 def main():
     parser = argparse.ArgumentParser(description="Evaluate M5 Models on ID and OOD splits")
     parser.add_argument("--env", type=str, default="local", help="Environment configuration name")
-    parser.add_argument("--exp-name", type=str, default="exp_001", help="Experiment name")
+    parser.add_argument("--exp-name", type=str, default=None,
+                        help="Experiment name (required — e.g. exp_full_phase1)")
     
     # Model checkpoint paths (optional overrides)
     parser.add_argument("--teacher-checkpoint", type=str, default=None, help="TFT teacher checkpoint path")
     parser.add_argument("--student-nokd-checkpoint", type=str, default=None, help="Student (No KD) checkpoint path")
     parser.add_argument("--student-kd-checkpoint", type=str, default=None, help="Student (With KD) checkpoint path")
+    # B-3: Inference batch size is now configurable. Default 256 preserves existing behaviour.
+    parser.add_argument("--batch-size", type=int, default=256,
+                        help="Inference batch size for model evaluation (default: 256)")
     args = parser.parse_args()
+
+    # B-4: Require an explicit experiment name to avoid accidentally overwriting
+    # existing artifacts (e.g. the pre-existing exp_001 evaluation results).
+    if args.exp_name is None:
+        raise ValueError(
+            "--exp-name is required. Provide a descriptive name for this run, "
+            "e.g. --exp-name exp_full_phase1"
+        )
 
     # 1. Load Configurations
     cfg = load_config(env_name=args.env)
@@ -226,39 +238,47 @@ def main():
     # Determine checkpoint paths, with defaults in outputs_dir
     outputs_dir = resolve_path(cfg.environment.outputs_dir)
     
+    from utils.paths import find_checkpoint, get_dataset_dir
+
     teacher_chk = args.teacher_checkpoint or cfg.evaluation.teacher_checkpoint
     if not teacher_chk:
-        teacher_chk = os.path.join(outputs_dir, "teacher", args.exp_name, "best_tft_teacher.ckpt")
+        teacher_chk = find_checkpoint(
+            cfg,
+            os.path.join(outputs_dir, "teacher", args.exp_name, "best_tft_teacher.ckpt"),
+            f"teacher/{args.exp_name}/best_tft_teacher.ckpt"
+        )
+    else:
+        teacher_chk = resolve_path(teacher_chk)
         
     student_nokd_chk = args.student_nokd_checkpoint or cfg.evaluation.student_nokd_checkpoint
     if not student_nokd_chk:
-        student_nokd_chk = os.path.join(outputs_dir, "student", "no_kd", args.exp_name, "best_student.ckpt")
+        student_nokd_chk = find_checkpoint(
+            cfg,
+            os.path.join(outputs_dir, "student", "no_kd", args.exp_name, "best_student.ckpt"),
+            f"student/no_kd/{args.exp_name}/best_student.ckpt"
+        )
+    else:
+        student_nokd_chk = resolve_path(student_nokd_chk)
         
     student_kd_chk = args.student_kd_checkpoint or cfg.evaluation.student_kd_checkpoint
     if not student_kd_chk:
-        student_kd_chk = os.path.join(outputs_dir, "student", "kd", args.exp_name, "best_student.ckpt")
-
-    teacher_chk = resolve_path(teacher_chk)
-    student_nokd_chk = resolve_path(student_nokd_chk)
-    student_kd_chk = resolve_path(student_kd_chk)
-
-    # Verify checkpoints exist
-    for path_name, path in [
-        ("TFT Teacher Checkpoint", teacher_chk),
-        ("Student (No KD) Checkpoint", student_nokd_chk),
-        ("Student (With KD) Checkpoint", student_kd_chk)
-    ]:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"{path_name} not found at: {path}")
+        student_kd_chk = find_checkpoint(
+            cfg,
+            os.path.join(outputs_dir, "student", "kd", args.exp_name, "best_student.ckpt"),
+            f"student/kd/{args.exp_name}/best_student.ckpt"
+        )
+    else:
+        student_kd_chk = resolve_path(student_kd_chk)
 
     # 2. Load Preprocessed Data
+    ds_dir = get_dataset_dir(cfg)
     if cfg.environment.store_filter:
         df = load_from_cache(
-            artifacts_dir=cfg.environment.artifacts_dir,
+            artifacts_dir=ds_dir,
             store_filter=cfg.environment.store_filter
         )
     else:
-        df = load_all_from_cache(artifacts_dir=cfg.environment.artifacts_dir)
+        df = load_all_from_cache(artifacts_dir=ds_dir)
         
     if df is None:
         raise FileNotFoundError(
@@ -339,7 +359,7 @@ def main():
         for store in stores:
             print(f"Evaluating store: {store}")
             df_part = load_from_cache(
-                artifacts_dir=cfg.environment.artifacts_dir,
+                artifacts_dir=ds_dir,
                 store_filter=store
             )
             if df_part is None:
@@ -367,9 +387,9 @@ def main():
             
             part_loader = part_ds.to_dataloader(
                 train=False,
-                batch_size=256,
+                batch_size=args.batch_size,
                 shuffle=False,
-                num_workers=0
+                num_workers=cfg.environment.num_workers
             )
             
             start_t = time.perf_counter()
@@ -384,10 +404,11 @@ def main():
             part_student_kd = get_predictions(student_kd, part_loader)
             student_kd_time += time.perf_counter() - start_t
             
-            # Limit for debug mode
+            # Limit for debug mode — uses args.batch_size so the limit is
+            # consistent with the actual DataLoader batch size above.
             max_batches_per_store = getattr(cfg.environment, "max_batches_per_store", None)
             if max_batches_per_store is not None:
-                limit_samples = max_batches_per_store * 256
+                limit_samples = max_batches_per_store * args.batch_size
                 part_teacher = part_teacher[:limit_samples]
                 part_student_nokd = part_student_nokd[:limit_samples]
                 part_student_kd = part_student_kd[:limit_samples]

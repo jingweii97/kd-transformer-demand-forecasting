@@ -42,6 +42,23 @@ def main():
         )
         del df  # release memory before next iteration
 
+    # Fit and serialize global metadata cache file
+    print("\nFitting and caching global metadata builder...")
+    import pickle
+    from data.dataset import StoreMetadataBuilder
+    from utils.paths import resolve_path
+    
+    builder = StoreMetadataBuilder(cfg)
+    builder.fit()
+    
+    # Save the global metadata builder to artifacts_dir
+    write_dir = resolve_path(os.path.join(cfg.environment.artifacts_dir, "metadata"))
+    os.makedirs(write_dir, exist_ok=True)
+    metadata_write_path = os.path.join(write_dir, "global_metadata.pkl")
+    print(f"Saving global metadata builder to cache: {metadata_write_path}")
+    with open(metadata_write_path, 'wb') as f:
+        pickle.dump(builder, f)
+
     print("\nDataset preparation stage completed successfully.")
 
 if __name__ == "__main__":

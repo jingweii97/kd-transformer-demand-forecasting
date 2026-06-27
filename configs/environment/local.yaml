@@ -2,6 +2,8 @@
 
 input_dir: "input"
 artifacts_dir: "artifacts"
+dataset_artifacts_dir: "artifacts"
+experiment_artifacts_dir: "artifacts"
 outputs_dir: "outputs"
 
 store_filter: "CA_1"  # "CA_1" for Phase 1 verification, "" or null for full M5 Phase 2.

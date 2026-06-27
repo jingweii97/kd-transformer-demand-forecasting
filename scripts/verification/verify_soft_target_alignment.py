@@ -27,8 +27,10 @@ def main():
     set_seed(cfg.environment.seed)
 
     # 1. Load preprocessed Parquet dataset
+    from utils.paths import get_dataset_dir, get_experiment_dir
+    ds_dir = get_dataset_dir(cfg)
     df = load_from_cache(
-        artifacts_dir=cfg.environment.artifacts_dir,
+        artifacts_dir=ds_dir,
         store_filter=cfg.environment.store_filter
     )
     if df is None:
@@ -44,8 +46,22 @@ def main():
     # 3. Load soft targets
     soft_targets_path = args.soft_targets_path
     if not soft_targets_path:
-        artifacts_dir = resolve_path(cfg.environment.artifacts_dir)
-        soft_targets_path = os.path.join(artifacts_dir, "soft_targets", "exp_001.pt")
+        exp_dir = getattr(cfg.environment, "experiment_artifacts_dir", None)
+        if exp_dir is not None:
+            exp_art_dir = get_experiment_dir(cfg)
+            path1 = os.path.join(exp_art_dir, "soft_targets", "exp_001.pt")
+            path2 = os.path.join(exp_art_dir, "outputs", "soft_targets", "exp_001.pt")
+            if os.path.exists(path1):
+                soft_targets_path = path1
+            elif os.path.exists(path2):
+                soft_targets_path = path2
+            else:
+                raise FileNotFoundError(
+                    f"Soft targets file not found under configured experiment_artifacts_dir at '{exp_art_dir}'"
+                )
+        else:
+            artifacts_dir = resolve_path(cfg.environment.artifacts_dir)
+            soft_targets_path = os.path.join(artifacts_dir, "soft_targets", "exp_001.pt")
     
     soft_targets_path_abs = resolve_path(soft_targets_path)
     print(f"Loading precomputed soft targets from: {soft_targets_path_abs}")
@@ -64,7 +80,8 @@ def main():
     
     # We sample 5 random series and starting times within the training window
     group_encoder = training_data._categorical_encoders['id']
-    unique_ids = list(group_encoder.classes_)
+    present_ids = set(df['id'].unique())
+    unique_ids = [uid for uid in group_encoder.classes_ if uid in present_ids]
     
     # Determine valid start day range (from L=90 to train_end - H=28 or max_day override)
     train_end = cfg.dataset.splits.train.end
