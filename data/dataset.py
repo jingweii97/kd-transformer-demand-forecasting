@@ -17,13 +17,15 @@ def build_timeseries_dataset(df, cfg, is_train=True, training_dataset=None, max_
     if is_train:
         # Slices training data strictly up to the end of the Training window
         train_end = cfg.dataset.splits.train.end
-
+        print(df.dtypes)
+        print(df.memory_usage(deep=True).sort_values(ascending=False).head(20))
         process = psutil.Process(os.getpid())
         print(f"Original df: {df.memory_usage(deep=True).sum()/1024**3:.2f} GB")
         print(f"RSS: {process.memory_info().rss/1024**3:.2f} GB")
         df_train = df[df['time_idx'] <= train_end].copy()
         print(f"After train slice RSS: {process.memory_info().rss/1024**3:.2f} GB")
 
+        
         print("Constructing TimeSeriesDataSet...")
 
         training_dataset = TimeSeriesDataSet(
