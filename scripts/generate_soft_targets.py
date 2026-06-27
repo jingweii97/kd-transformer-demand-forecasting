@@ -62,29 +62,97 @@ def main():
     teacher = TemporalFusionTransformer.load_from_checkpoint(checkpoint_path_abs)
     teacher.eval()  # Set to evaluation mode
 
-    # 4. Build Inference Dataloader via Partition Manager
-    from data.dataset import StorePartitionManager
-    partition_manager = StorePartitionManager(training_data, cfg)
-    inference_loader = partition_manager.test_dataloader(
-        batch_size=args.batch_size,
-        max_idx=max_day,
-        predict=False  # sliding windows
-    )
-
-    # 5. Generate Point Forecasts (Median/0.5 Quantile predictions)
-    print("Generating teacher forecasts over all sliding windows...")
-    with torch.no_grad():
-        preds = teacher.predict(inference_loader, mode="prediction")
+    import gc
+    from data.cache import STORES
     
-    print(f"Generated predictions tensor shape: {preds.shape}")
-
-    # 6. Map Predictions to Group Codes and Start Times Vectorially
-    print("Mapping and organizing predictions into a 3D lookup tensor...")
+    # 4. Loop over store partitions and generate predictions
+    print(f"Generating teacher forecasts store-by-store up to Day {max_day}...")
+    
+    # Determine the stores to load
+    store_filter = cfg.environment.store_filter
+    stores = [store_filter] if store_filter else list(STORES)
+    
+    # Debug limits
+    max_stores = getattr(cfg.environment, "max_stores", None)
+    if max_stores is not None:
+        stores = stores[:max_stores]
+        
+    max_encoder_length = cfg.dataset.lookback_window
+    max_prediction_length = cfg.dataset.prediction_window
+    min_idx = max_day - max_encoder_length - max_prediction_length + 1
+    
+    all_preds = []
+    all_group_names = []
+    all_start_times = []
+    
+    for store in stores:
+        print(f"Generating forecasts for store: {store}")
+        df_part = load_from_cache(
+            artifacts_dir=cfg.environment.artifacts_dir,
+            store_filter=store
+        )
+        if df_part is None:
+            raise FileNotFoundError(f"Cache not found for store: {store}")
+            
+        # Slicing evaluation window
+        df_part_sliced = df_part[(df_part['time_idx'] >= min_idx) & (df_part['time_idx'] <= max_day)].copy()
+        del df_part
+        
+        # Re-convert to category columns for consistency
+        cat_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id',
+                    'weekday', 'month', 'year', 'event_name_1', 'event_type_1']
+        for col in cat_cols:
+            if col in df_part_sliced.columns:
+                df_part_sliced[col] = df_part_sliced[col].astype(str).astype('category')
+                
+        if len(df_part_sliced) == 0:
+            continue
+            
+        # Construct standard TimeSeriesDataSet from training_data base dataset
+        part_ds = TimeSeriesDataSet.from_dataset(
+            training_data,
+            df_part_sliced,
+            predict=False,  # sliding windows
+            stop_randomization=True
+        )
+        del df_part_sliced
+        
+        # Create standard DataLoader
+        part_loader = part_ds.to_dataloader(
+            train=False,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0
+        )
+        
+        # Generate predictions for this partition
+        with torch.no_grad():
+            part_preds = teacher.predict(part_loader, mode="prediction")
+            
+        # Limit predictions in debug mode
+        max_batches_per_store = getattr(cfg.environment, "max_batches_per_store", None)
+        if max_batches_per_store is not None:
+            limit_samples = max_batches_per_store * args.batch_size
+            part_preds = part_preds[:limit_samples]
+            part_decoded = part_ds.decoded_index.head(limit_samples)
+        else:
+            part_decoded = part_ds.decoded_index
+            
+        # Collect predictions and index details
+        all_preds.append(part_preds.cpu())
+        all_group_names.extend(part_decoded['id'].values)
+        all_start_times.extend(part_decoded['time_idx_first_prediction'].values)
+        
+        # Memory cleanup
+        del part_loader
+        del part_ds
+        gc.collect()
+        
+    # Aggregate predictions across stores
+    preds = torch.cat(all_preds, dim=0)
     group_encoder = training_data._categorical_encoders['id']
-    decoded_index = partition_manager.get_decoded_index()
-    group_names = decoded_index['id'].values
-    group_codes = group_encoder.transform(group_names)
-    start_times = decoded_index['time_idx_first_prediction'].values
+    group_codes = group_encoder.transform(all_group_names)
+    start_times = np.array(all_start_times)
 
     # Check mapping alignment
     assert len(preds) == len(group_codes) == len(start_times), "Mismatch in prediction shapes and index lengths."

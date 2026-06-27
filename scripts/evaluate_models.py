@@ -40,35 +40,21 @@ def get_predictions(model, loader):
     # For TFT Teacher, use PyTorch Forecasting's built-in predict method
     if isinstance(model, TemporalFusionTransformer):
         preds = model.predict(loader, mode="prediction")
-        preds = preds.cpu().numpy()
-    else:
-        # For custom Student models, run standard batch evaluation
-        model.eval()
-        all_preds = []
-        with torch.no_grad():
-            for batch in loader:
-                x, _ = batch
-                if hasattr(model, "device"):
-                    for k in x.keys():
-                        if isinstance(x[k], torch.Tensor):
-                            x[k] = x[k].to(model.device)
-                preds = model(x)
-                all_preds.append(preds.cpu())
-        preds = torch.cat(all_preds, dim=0).numpy()
+        return preds.cpu().numpy()
         
-    # If the loader is partitioned, align preds alphabetically
-    if hasattr(loader, "dataset") and hasattr(loader.dataset, "partition_manager"):
-        partition_manager = loader.dataset.partition_manager
-        if partition_manager is not None:
-            decoded = partition_manager.get_decoded_index()
-            if decoded is not None:
-                decoded['pred_idx'] = np.arange(len(decoded))
-                # Sort alphabetically by id and prediction start time
-                decoded_sorted = decoded.sort_values(by=['id', 'time_idx_first_prediction'])
-                target_indices = decoded_sorted['pred_idx'].values
-                preds = preds[target_indices]
-                
-    return preds
+    # For custom Student models, run standard batch evaluation
+    model.eval()
+    all_preds = []
+    with torch.no_grad():
+        for batch in loader:
+            x, _ = batch
+            if hasattr(model, "device"):
+                for k in x.keys():
+                    if isinstance(x[k], torch.Tensor):
+                        x[k] = x[k].to(model.device)
+            preds = model(x)
+            all_preds.append(preds.cpu())
+    return torch.cat(all_preds, dim=0).numpy()
 
 def compute_wrmsse_weights_and_scales(df_train, train_end):
     """
@@ -281,9 +267,6 @@ def main():
     from data.dataset import StorePartitionManager
     partition_manager = StorePartitionManager(training_data, cfg)
     
-    id_loader = partition_manager.test_dataloader(batch_size=256, max_idx=id_end, predict=True)
-    ood_loader = partition_manager.test_dataloader(batch_size=256, max_idx=ood_end, predict=True)
-
     # 4. Load Models
     print("Loading models from checkpoints...")
     teacher = TemporalFusionTransformer.load_from_checkpoint(teacher_chk)
@@ -299,9 +282,9 @@ def main():
     results = []
 
     # Loop ID and OOD windows
-    for test_name, loader, start_day, end_day in [
-        ("ID Test", id_loader, id_start, id_end),
-        ("OOD Test", ood_loader, ood_start, ood_end)
+    for test_name, start_day, end_day in [
+        ("ID Test", id_start, id_end),
+        ("OOD Test", ood_start, ood_end)
     ]:
         print(f"\n--- Evaluating Models on {test_name} (Days {start_day} to {end_day}) ---")
         
@@ -309,37 +292,136 @@ def main():
         df_test_gt = df[(df['time_idx'] >= start_day) & (df['time_idx'] <= end_day)].copy()
         df_test_gt = df_test_gt.sort_values(by=['id', 'time_idx']).reset_index(drop=True)
         
-        actuals = df_test_gt['sales'].values.reshape(-1, 28)
-        num_series = actuals.shape[0]
-        
-        # Get series ids and map to precomputed MASE scales
-        series_ids = df_test_gt['id'].drop_duplicates().values
-        assert len(series_ids) == num_series, "Mismatch in series count and scales count."
-        scales_array = np.array([mase_scales_dict[sid] for sid in series_ids])
-        
         # 5.1 Seasonal Naive Predictions
         print("Generating forecasts from Seasonal Naive...")
         start_t = time.perf_counter()
         df_naive_source = df[(df['time_idx'] >= (start_day - 28)) & (df['time_idx'] < start_day)].copy()
         df_naive_source = df_naive_source.sort_values(by=['id', 'time_idx']).reset_index(drop=True)
-        naive_forecasts = df_naive_source['sales'].values.reshape(-1, 28)
         naive_time = time.perf_counter() - start_t
         
-        # 5.2 Model Predictions
-        print("Generating forecasts from TFT Teacher...")
-        start_t = time.perf_counter()
-        teacher_forecasts = get_predictions(teacher, loader)
-        teacher_time = time.perf_counter() - start_t
+        # 5.2 Model Predictions store-by-store
+        print("Generating model forecasts store-by-store...")
+        import gc
+        from data.cache import STORES
         
-        print("Generating forecasts from Transformer Student (Without KD)...")
-        start_t = time.perf_counter()
-        student_nokd_forecasts = get_predictions(student_nokd, loader)
-        student_nokd_time = time.perf_counter() - start_t
+        # Determine the stores to load
+        store_filter = cfg.environment.store_filter
+        stores = [store_filter] if store_filter else list(STORES)
         
-        print("Generating forecasts from Transformer Student (With KD)...")
-        start_t = time.perf_counter()
-        student_kd_forecasts = get_predictions(student_kd, loader)
-        student_kd_time = time.perf_counter() - start_t
+        max_stores = getattr(cfg.environment, "max_stores", None)
+        if max_stores is not None:
+            stores = stores[:max_stores]
+            
+        max_encoder_length = cfg.dataset.lookback_window
+        max_prediction_length = cfg.dataset.prediction_window
+        min_idx = end_day - max_encoder_length - max_prediction_length + 1
+        
+        all_teacher_preds = []
+        all_student_nokd_preds = []
+        all_student_kd_preds = []
+        all_decoded = []
+        
+        teacher_time = 0.0
+        student_nokd_time = 0.0
+        student_kd_time = 0.0
+        
+        for store in stores:
+            print(f"Evaluating store: {store}")
+            df_part = load_from_cache(
+                artifacts_dir=cfg.environment.artifacts_dir,
+                store_filter=store
+            )
+            if df_part is None:
+                raise FileNotFoundError(f"Cache not found for store: {store}")
+                
+            df_part_sliced = df_part[(df_part['time_idx'] >= min_idx) & (df_part['time_idx'] <= end_day)].copy()
+            del df_part
+            
+            cat_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id',
+                        'weekday', 'month', 'year', 'event_name_1', 'event_type_1']
+            for col in cat_cols:
+                if col in df_part_sliced.columns:
+                    df_part_sliced[col] = df_part_sliced[col].astype(str).astype('category')
+                    
+            if len(df_part_sliced) == 0:
+                continue
+                
+            part_ds = TimeSeriesDataSet.from_dataset(
+                training_data,
+                df_part_sliced,
+                predict=True,
+                stop_randomization=True
+            )
+            del df_part_sliced
+            
+            part_loader = part_ds.to_dataloader(
+                train=False,
+                batch_size=256,
+                shuffle=False,
+                num_workers=0
+            )
+            
+            start_t = time.perf_counter()
+            part_teacher = get_predictions(teacher, part_loader)
+            teacher_time += time.perf_counter() - start_t
+            
+            start_t = time.perf_counter()
+            part_student_nokd = get_predictions(student_nokd, part_loader)
+            student_nokd_time += time.perf_counter() - start_t
+            
+            start_t = time.perf_counter()
+            part_student_kd = get_predictions(student_kd, part_loader)
+            student_kd_time += time.perf_counter() - start_t
+            
+            # Limit for debug mode
+            max_batches_per_store = getattr(cfg.environment, "max_batches_per_store", None)
+            if max_batches_per_store is not None:
+                limit_samples = max_batches_per_store * 256
+                part_teacher = part_teacher[:limit_samples]
+                part_student_nokd = part_student_nokd[:limit_samples]
+                part_student_kd = part_student_kd[:limit_samples]
+                part_decoded = part_ds.decoded_index.head(limit_samples)
+            else:
+                part_decoded = part_ds.decoded_index
+                
+            all_teacher_preds.append(part_teacher)
+            all_student_nokd_preds.append(part_student_nokd)
+            all_student_kd_preds.append(part_student_kd)
+            all_decoded.append(part_decoded)
+            
+            del part_loader
+            del part_ds
+            gc.collect()
+            
+        # Aggregate predictions across stores
+        teacher_forecasts = np.concatenate(all_teacher_preds, axis=0)
+        student_nokd_forecasts = np.concatenate(all_student_nokd_preds, axis=0)
+        student_kd_forecasts = np.concatenate(all_student_kd_preds, axis=0)
+        concatenated_decoded = pd.concat(all_decoded, ignore_index=True)
+        
+        # In debug mode (or when limiting stores/batches), filter df_test_gt to match decoded index series
+        active_ids = set(concatenated_decoded['id'].unique())
+        df_test_gt = df_test_gt[df_test_gt['id'].isin(active_ids)].reset_index(drop=True)
+        
+        actuals = df_test_gt['sales'].values.reshape(-1, 28)
+        num_series = actuals.shape[0]
+        
+        # Re-get series ids and naive forecasts for the active subset
+        series_ids = df_test_gt['id'].drop_duplicates().values
+        assert len(series_ids) == num_series, "Mismatch in series count and scales count."
+        scales_array = np.array([mase_scales_dict[sid] for sid in series_ids])
+        
+        df_naive_source = df_naive_source[df_naive_source['id'].isin(active_ids)].reset_index(drop=True)
+        naive_forecasts = df_naive_source['sales'].values.reshape(-1, 28)
+        
+        # Sort predictions alphabetically by id to match the filtered df_test_gt
+        concatenated_decoded['pred_idx'] = np.arange(len(concatenated_decoded))
+        decoded_sorted = concatenated_decoded.sort_values(by=['id', 'time_idx_first_prediction'])
+        target_indices = decoded_sorted['pred_idx'].values
+        
+        teacher_forecasts = teacher_forecasts[target_indices]
+        student_nokd_forecasts = student_nokd_forecasts[target_indices]
+        student_kd_forecasts = student_kd_forecasts[target_indices]
 
         # Shape integrity check
         assert actuals.shape == naive_forecasts.shape == teacher_forecasts.shape == student_nokd_forecasts.shape == student_kd_forecasts.shape

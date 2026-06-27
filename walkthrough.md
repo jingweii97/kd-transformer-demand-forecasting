@@ -151,21 +151,21 @@ To support complete out-of-core training and evaluation across all 10 store part
     - Instantiates `base_dataset` as a real, unmodified `TimeSeriesDataSet` on a **"minimal metadata dataset"** (first 118 days).
     - Serializes and caches the fitted metadata builder to [artifacts/metadata/global_metadata.pkl](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/artifacts/metadata/global_metadata.pkl) on the first training run, and reloads it dynamically on subsequent script runs to eliminate duplicate raw dataset scans.
   - **Decoupled Partition Manager (`StorePartitionManager`)**:
-    - Manages partitioned dataloader creation (`train_dataloader()`, `val_dataloader()`, `test_dataloader()`) wrapping PyTorch's `IterableDataset`.
-    - Exposes a read-only index lookup method `get_decoded_index()` to safely expose partition-level prediction alignments.
+    - Manages partitioned dataloader creation for training (`train_dataloader()`, `val_dataloader()`) wrapping PyTorch's `IterableDataset`.
   - **Partitioned Data Streaming (`StorePartitionedDataset`)**:
     - Sequentially streams Parquet partitions from disk store-by-store.
-    - Shuffles the partition sequence order during training, and processes deterministically for validation, evaluation, and soft-target generation.
+    - Shuffles the partition sequence order during training.
     - Yields native PyTorch Forecasting batch formats directly from each partition's own `TimeSeriesDataSet.to_dataloader()`.
     - Performs explicit memory cleanup (`del` and `gc.collect()`) after each partition.
     - Exposes `max_stores` and `max_batches_per_store` debug parameters.
 * **Script Integrations**:
-  - **[scripts/train_teacher.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/train_teacher.py)** & **[scripts/train_student.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/train_student.py)**: Updated to use `StorePartitionManager` to create the training/validation loaders. Model building continues to use the standard base `TimeSeriesDataSet` objects.
-  - **[scripts/generate_soft_targets.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/generate_soft_targets.py)**: Integrates the partitioned test dataloader and maps predictions vectorially using `partition_manager.get_decoded_index()`.
-  - **[scripts/evaluate_models.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/evaluate_models.py)**: Updates `get_predictions()` to check if the loader is partitioned and automatically align prediction arrays alphabetically to match validation ground truth sequence order using `partition_manager.get_decoded_index()`.
+  - **[scripts/train_teacher.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/train_teacher.py)** & **[scripts/train_student.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/train_student.py)**: Use `StorePartitionManager` to create the training/validation loaders. Model building continues to use the standard base `TimeSeriesDataSet` objects.
+  - **[scripts/generate_soft_targets.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/generate_soft_targets.py)**: Performs store-by-store loop to build standard `TimeSeriesDataSet` slices, generate predictions using the teacher model, release memory, and aggregate predictions.
+  - **[scripts/evaluate_models.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/evaluate_models.py)**: Loops over stores, builds standard `TimeSeriesDataSet` slices, predicts, and aggregates predictions across all stores. Afterwards, aligns predictions alphabetically by `id` and prediction first step to match the ground truth sequence order.
   - **[scripts/verification/verify_soft_target_alignment.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/verification/verify_soft_target_alignment.py)**: Left on the standard (non-streaming) `TimeSeriesDataSet.from_dataset` logic since it operates on a single sequence and acts as a trusted verification baseline.
 
 This partitioned strategy keeps the training scripts, models, parameters, normalizations, and evaluation routines 100% unchanged, ensuring complete scientific fidelity and reproducibility.
+ibility.
 
 
 
