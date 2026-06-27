@@ -131,7 +131,10 @@ def main():
             part_preds = teacher.predict(
                 part_loader,
                 mode="prediction",
-                trainer_kwargs={"strategy": "single_device", "devices": 1}
+                trainer_kwargs={
+                    "accelerator": "cuda" if torch.cuda.is_available() else "cpu",
+                    "devices": 1
+                }
             )
             
         # Limit predictions in debug mode

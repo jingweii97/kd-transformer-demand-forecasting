@@ -4,7 +4,7 @@ import argparse
 import torch
 import numpy as np
 import pandas as pd
-from pytorch_forecasting import TemporalFusionTransformer
+from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 
 # Add repository root to python path to allow importing packages
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,7 +42,10 @@ def get_predictions(model, loader):
         preds = model.predict(
             loader,
             mode="prediction",
-            trainer_kwargs={"strategy": "single_device", "devices": 1}
+            trainer_kwargs={
+                "accelerator": "cuda" if torch.cuda.is_available() else "cpu",
+                "devices": 1
+            }
         )
         return preds.cpu().numpy()
         

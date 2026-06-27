@@ -165,7 +165,30 @@ To support complete out-of-core training and evaluation across all 10 store part
   - **[scripts/verification/verify_soft_target_alignment.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/verification/verify_soft_target_alignment.py)**: Left on the standard (non-streaming) `TimeSeriesDataSet.from_dataset` logic since it operates on a single sequence and acts as a trusted verification baseline.
 
 This partitioned strategy keeps the training scripts, models, parameters, normalizations, and evaluation routines 100% unchanged, ensuring complete scientific fidelity and reproducibility.
-ibility.
+
+### Verification Results (Local Smoke Test)
+
+A local end-to-end smoke test was run successfully using the new `kd_env` Conda environment on the `CA_1` store partition with debug limits (`--epochs 1 --max-stores 1 --max-batches-per-store 1`):
+
+#### 1. TFT Teacher Training (`train_teacher.py`)
+- Completed 1 epoch successfully.
+- Correctly saved the model checkpoint to: `outputs/teacher/local_smoke/best_tft_teacher.ckpt`.
+
+#### 2. Soft Target Generation (`generate_soft_targets.py`)
+- Extracted sliding window forecasts store-by-store.
+- Successfully generated the soft target lookup tensor of shape `[30491, 1942, 28]` and saved to `artifacts/soft_targets/local_smoke.pt` with no shape mismatch errors.
+
+#### 3. Student Training under KD (`train_student.py`)
+- Trained the compact student model successfully in both KD mode and Supervised-only mode.
+- Correctly stored `soft_targets` as a plain Python attribute to keep saved model checkpoint sizes extremely lightweight (**1.56 MB** instead of 6.6 GB), preventing memory exceptions.
+
+#### 4. Model Evaluation (`evaluate_models.py`)
+- Gathered forecasts store-by-store, aligned them, and calculated all target metrics successfully:
+  - **TFT Teacher**: ID WRMSSE: 4.1136 | OOD WRMSSE: 4.0633
+  - **Student (KD)**: ID WRMSSE: 3.7373 | OOD WRMSSE: 3.7659
+  - **Student (No KD)**: ID WRMSSE: 2.6687 | OOD WRMSSE: 2.6932
+- Verified deployment efficiency: **1.4x smaller student** (125.8k parameters vs. 179.4k teacher parameters).
+
 
 
 

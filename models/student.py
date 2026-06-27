@@ -26,11 +26,8 @@ class M5TransformerStudent(pl.LightningModule):
         self.lookback_window = lookback_window
         self.prediction_window = prediction_window
         
-        # Register soft targets lookup tensor
-        if soft_targets is not None:
-            self.register_buffer("soft_targets", soft_targets)
-        else:
-            self.soft_targets = None
+        # Store soft targets lookup tensor as a plain attribute to avoid saving it in checkpoints (6.6 GB)
+        self.soft_targets = soft_targets
 
         # Categorical columns in the exact order PyTorch Forecasting stacks them
         self.cat_cols = training_dataset.categoricals
@@ -92,7 +89,7 @@ class M5TransformerStudent(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch
-        if isinstance(y, tuple):
+        if isinstance(y, (tuple, list)):
             y = y[0]
         preds = self(x)
         
@@ -102,7 +99,9 @@ class M5TransformerStudent(pl.LightningModule):
             group_ids = x['groups'][:, 0].long()
             start_times = x['decoder_time_idx'][:, 0].long()
             
-            # Lookup teacher soft targets
+            # Lookup teacher soft targets (move dynamically to device if needed)
+            if self.soft_targets.device != self.device:
+                self.soft_targets = self.soft_targets.to(self.device)
             teacher_preds = self.soft_targets[group_ids, start_times]
             
             # Compute losses
@@ -121,7 +120,7 @@ class M5TransformerStudent(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        if isinstance(y, tuple):
+        if isinstance(y, (tuple, list)):
             y = y[0]
         preds = self(x)
         
