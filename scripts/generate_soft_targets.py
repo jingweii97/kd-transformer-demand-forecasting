@@ -62,34 +62,29 @@ def main():
     teacher = TemporalFusionTransformer.load_from_checkpoint(checkpoint_path_abs)
     teacher.eval()  # Set to evaluation mode
 
-    # 4. Build Inference Dataset up to day limits
-    print(f"Creating sliding window inference dataset up to Day {max_day}...")
-    df_inference = df[df['time_idx'] <= max_day].copy()
-    
-    # We want sliding windows across all training and validation prediction points
-    inference_ds = TimeSeriesDataSet.from_dataset(
-        training_data,
-        df_inference,
-        predict=False,  # sliding windows
-        stop_randomization=True
+    # 4. Build Inference Dataloader via Partition Manager
+    from data.dataset import StorePartitionManager
+    partition_manager = StorePartitionManager(training_data, cfg)
+    inference_loader = partition_manager.test_dataloader(
+        batch_size=args.batch_size,
+        max_idx=max_day,
+        predict=False  # sliding windows
     )
 
-    # 5. Create DataLoader
-    inference_loader = inference_ds.to_dataloader(train=False, batch_size=args.batch_size, shuffle=False, num_workers=0)
-
-    # 6. Generate Point Forecasts (Median/0.5 Quantile predictions)
+    # 5. Generate Point Forecasts (Median/0.5 Quantile predictions)
     print("Generating teacher forecasts over all sliding windows...")
     with torch.no_grad():
         preds = teacher.predict(inference_loader, mode="prediction")
     
     print(f"Generated predictions tensor shape: {preds.shape}")
 
-    # 7. Map Predictions to Group Codes and Start Times Vectorially
+    # 6. Map Predictions to Group Codes and Start Times Vectorially
     print("Mapping and organizing predictions into a 3D lookup tensor...")
     group_encoder = training_data._categorical_encoders['id']
-    group_names = inference_ds.decoded_index['id'].values
+    decoded_index = partition_manager.get_decoded_index()
+    group_names = decoded_index['id'].values
     group_codes = group_encoder.transform(group_names)
-    start_times = inference_ds.decoded_index['time_idx_first_prediction'].values
+    start_times = decoded_index['time_idx_first_prediction'].values
 
     # Check mapping alignment
     assert len(preds) == len(group_codes) == len(start_times), "Mismatch in prediction shapes and index lengths."

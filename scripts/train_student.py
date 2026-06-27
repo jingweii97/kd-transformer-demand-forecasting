@@ -68,20 +68,15 @@ def main():
     # 3. Build Datasets
     print("Building TimeSeriesDataSet objects...")
     training_data = build_timeseries_dataset(df, cfg, is_train=True)
-    validation_data = build_timeseries_dataset(
-        df, cfg, is_train=False, 
-        training_dataset=training_data, 
-        max_idx=cfg.dataset.splits.validation.end
-    )
+    
+    from data.dataset import StorePartitionManager
+    partition_manager = StorePartitionManager(training_data, cfg)
 
-    # 4. Create DataLoaders
-    train_loader = training_data.to_dataloader(
-        train=True, batch_size=batch_size, 
-        num_workers=cfg.environment.num_workers
-    )
-    val_loader = validation_data.to_dataloader(
-        train=False, batch_size=batch_size, 
-        num_workers=cfg.environment.num_workers
+    # 4. Create DataLoaders via Partition Manager
+    train_loader = partition_manager.train_dataloader(batch_size=batch_size)
+    val_loader = partition_manager.val_dataloader(
+        batch_size=batch_size, 
+        max_idx=cfg.dataset.splits.validation.end
     )
 
     # 5. Load Soft Targets if running under KD

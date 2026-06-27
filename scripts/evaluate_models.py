@@ -40,21 +40,35 @@ def get_predictions(model, loader):
     # For TFT Teacher, use PyTorch Forecasting's built-in predict method
     if isinstance(model, TemporalFusionTransformer):
         preds = model.predict(loader, mode="prediction")
-        return preds.cpu().numpy()
+        preds = preds.cpu().numpy()
+    else:
+        # For custom Student models, run standard batch evaluation
+        model.eval()
+        all_preds = []
+        with torch.no_grad():
+            for batch in loader:
+                x, _ = batch
+                if hasattr(model, "device"):
+                    for k in x.keys():
+                        if isinstance(x[k], torch.Tensor):
+                            x[k] = x[k].to(model.device)
+                preds = model(x)
+                all_preds.append(preds.cpu())
+        preds = torch.cat(all_preds, dim=0).numpy()
         
-    # For custom Student models, run standard batch evaluation
-    model.eval()
-    all_preds = []
-    with torch.no_grad():
-        for batch in loader:
-            x, _ = batch
-            if hasattr(model, "device"):
-                for k in x.keys():
-                    if isinstance(x[k], torch.Tensor):
-                        x[k] = x[k].to(model.device)
-            preds = model(x)
-            all_preds.append(preds.cpu())
-    return torch.cat(all_preds, dim=0).numpy()
+    # If the loader is partitioned, align preds alphabetically
+    if hasattr(loader, "dataset") and hasattr(loader.dataset, "partition_manager"):
+        partition_manager = loader.dataset.partition_manager
+        if partition_manager is not None:
+            decoded = partition_manager.get_decoded_index()
+            if decoded is not None:
+                decoded['pred_idx'] = np.arange(len(decoded))
+                # Sort alphabetically by id and prediction start time
+                decoded_sorted = decoded.sort_values(by=['id', 'time_idx_first_prediction'])
+                target_indices = decoded_sorted['pred_idx'].values
+                preds = preds[target_indices]
+                
+    return preds
 
 def compute_wrmsse_weights_and_scales(df_train, train_end):
     """
@@ -264,11 +278,11 @@ def main():
     ood_start = cfg.dataset.splits.ood_test.start
     ood_end = cfg.dataset.splits.ood_test.end
     
-    id_ds = build_timeseries_dataset(df, cfg, is_train=False, training_dataset=training_data, max_idx=id_end)
-    ood_ds = build_timeseries_dataset(df, cfg, is_train=False, training_dataset=training_data, max_idx=ood_end)
+    from data.dataset import StorePartitionManager
+    partition_manager = StorePartitionManager(training_data, cfg)
     
-    id_loader = id_ds.to_dataloader(train=False, batch_size=256, shuffle=False, num_workers=0)
-    ood_loader = ood_ds.to_dataloader(train=False, batch_size=256, shuffle=False, num_workers=0)
+    id_loader = partition_manager.test_dataloader(batch_size=256, max_idx=id_end, predict=True)
+    ood_loader = partition_manager.test_dataloader(batch_size=256, max_idx=ood_end, predict=True)
 
     # 4. Load Models
     print("Loading models from checkpoints...")

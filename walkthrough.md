@@ -137,3 +137,36 @@ The following table compares the measured memory profile before and after this o
 | **RSS after train slice** | 15.75 GB | **~5.01 GB** |
 | **TimeSeriesDataSet construction** | OOM | **PASS** |
 
+---
+
+## 5. Phase 2C: Partitioned Training & Evaluation (Decoupled Partition Manager)
+
+To support complete out-of-core training and evaluation across all 10 store partitions without exceeding Kaggle's RAM limits, we implemented a decoupled partition management architecture that uses a standard `TimeSeriesDataSet` for model building, while introducing a separate `StorePartitionManager` class to create the streamed dataloaders.
+
+### Changes Made
+
+* **[data/dataset.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/data/dataset.py)**:
+  - **Metadata Serialization Cache (`StoreMetadataBuilder`)**:
+    - Scans and fits global categorical encoders and the target `GroupNormalizer` once.
+    - Instantiates `base_dataset` as a real, unmodified `TimeSeriesDataSet` on a **"minimal metadata dataset"** (first 118 days).
+    - Serializes and caches the fitted metadata builder to [artifacts/metadata/global_metadata.pkl](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/artifacts/metadata/global_metadata.pkl) on the first training run, and reloads it dynamically on subsequent script runs to eliminate duplicate raw dataset scans.
+  - **Decoupled Partition Manager (`StorePartitionManager`)**:
+    - Manages partitioned dataloader creation (`train_dataloader()`, `val_dataloader()`, `test_dataloader()`) wrapping PyTorch's `IterableDataset`.
+    - Exposes a read-only index lookup method `get_decoded_index()` to safely expose partition-level prediction alignments.
+  - **Partitioned Data Streaming (`StorePartitionedDataset`)**:
+    - Sequentially streams Parquet partitions from disk store-by-store.
+    - Shuffles the partition sequence order during training, and processes deterministically for validation, evaluation, and soft-target generation.
+    - Yields native PyTorch Forecasting batch formats directly from each partition's own `TimeSeriesDataSet.to_dataloader()`.
+    - Performs explicit memory cleanup (`del` and `gc.collect()`) after each partition.
+    - Exposes `max_stores` and `max_batches_per_store` debug parameters.
+* **Script Integrations**:
+  - **[scripts/train_teacher.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/train_teacher.py)** & **[scripts/train_student.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/train_student.py)**: Updated to use `StorePartitionManager` to create the training/validation loaders. Model building continues to use the standard base `TimeSeriesDataSet` objects.
+  - **[scripts/generate_soft_targets.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/generate_soft_targets.py)**: Integrates the partitioned test dataloader and maps predictions vectorially using `partition_manager.get_decoded_index()`.
+  - **[scripts/evaluate_models.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/evaluate_models.py)**: Updates `get_predictions()` to check if the loader is partitioned and automatically align prediction arrays alphabetically to match validation ground truth sequence order using `partition_manager.get_decoded_index()`.
+  - **[scripts/verification/verify_soft_target_alignment.py](file:///c:/Users/jw/OneDrive%20-%20Universiti%20Malaya/Sem_2%20Study%20Material/WQF7023/repo/scripts/verification/verify_soft_target_alignment.py)**: Left on the standard (non-streaming) `TimeSeriesDataSet.from_dataset` logic since it operates on a single sequence and acts as a trusted verification baseline.
+
+This partitioned strategy keeps the training scripts, models, parameters, normalizations, and evaluation routines 100% unchanged, ensuring complete scientific fidelity and reproducibility.
+
+
+
+
