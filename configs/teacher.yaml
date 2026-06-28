@@ -4,8 +4,8 @@ hidden_size: 32
 attention_heads: 4
 dropout: 0.1
 lr: 0.001
-epochs: 10
-batch_size: 64
-patience: 4
+epochs: 5
+batch_size: 256
+patience: 3
 limit_train_batches: null
 limit_val_batches: null

@@ -4,6 +4,7 @@ target: "sales"
 group_ids: ["id"]
 lookback_window: 90       # L = 90 days
 prediction_window: 28     # H = 28 days
+window_stride: 7          # Sliding window step size; 1 = fully overlapping, 7 = weekly stride
 
 # Chronological split definitions (1-based day indices)
 splits:

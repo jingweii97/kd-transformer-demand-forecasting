@@ -84,6 +84,19 @@ class StorePartitionedDataset(IterableDataset):
             # Construct dataset using PyTorch Forecasting API exactly as intended
             if self.is_train:
                 part_ds = TimeSeriesDataSet.from_dataset(self.base_dataset, df_part_sliced)
+                
+                # Apply configurable window stride (training only).
+                # Uses the official filter() API on time_idx_first_prediction — the decoder
+                # start time index exposed by decoded_index — so subsampling is aligned to
+                # consistent calendar positions across all series rather than arbitrary row
+                # offsets.  stride=1 is a no-op (all windows retained).
+                stride = getattr(self.cfg.dataset, "window_stride", 1)
+                if stride > 1:
+                    time_col = "time_idx_first_prediction"
+                    part_ds = part_ds.filter(
+                        lambda idx: idx[time_col] % stride == 0
+                    )
+
             else:
                 part_ds = TimeSeriesDataSet.from_dataset(
                     self.base_dataset,
@@ -97,17 +110,14 @@ class StorePartitionedDataset(IterableDataset):
             if self.partition_manager is not None:
                 decoded_indices.append(part_ds.decoded_index)
             
-            # Create partition-level DataLoader
-            # num_workers comes from cfg so the value is environment-appropriate
-            # (0 = local/Windows, 2 = Kaggle, 4 = DICC). The outer DataLoader
-            # wrappers in StorePartitionManager intentionally keep num_workers=0
-            # because wrapping an IterableDataset with workers > 0 duplicates data.
             part_loader = part_ds.to_dataloader(
                 train=self.is_train,
                 batch_size=self.batch_size,
                 shuffle=self.is_train,
                 num_workers=self.cfg.environment.num_workers
             )
+            
+            print(f"Store: {store} | TimeSeriesDataSet len: {len(part_ds)} | DataLoader len: {len(part_loader)}")
             
             # Yield batches directly
             batch_count = 0

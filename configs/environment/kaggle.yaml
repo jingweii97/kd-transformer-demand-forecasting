@@ -12,6 +12,6 @@ store_filter: ""  # Empty means full dataset (30,490 series)
 accelerator: "gpu"
 devices: 1
 num_workers: 2
-precision: 32
+precision: "16-mixed"
 
 seed: 42
