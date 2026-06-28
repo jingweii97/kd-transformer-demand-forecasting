@@ -71,7 +71,11 @@ def main():
     checkpoint_path_abs = resolve_path(args.checkpoint_path)
     print(f"Loading TFT teacher model from checkpoint: {checkpoint_path_abs}")
     teacher = TemporalFusionTransformer.load_from_checkpoint(checkpoint_path_abs)
-    teacher.eval()  # Set to evaluation mode
+    
+    # Run in evaluation mode and move to device
+    teacher.eval()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    teacher = teacher.to(device)
 
     import gc
     from data.cache import STORES
@@ -170,16 +174,16 @@ def main():
             else:
                 limit_samples = None
             
-            # Generate predictions for this chunk
+            # Generate predictions for this chunk using native PyTorch forward pass
+            chunk_preds_list = []
             with torch.no_grad():
-                chunk_preds = teacher.predict(
-                    chunk_loader,
-                    mode="prediction",
-                    trainer_kwargs={
-                        "accelerator": "cuda" if torch.cuda.is_available() else "cpu",
-                        "devices": 1
-                    }
-                )
+                for batch in chunk_loader:
+                    x, _ = batch
+                    x_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in x.items()}
+                    out = teacher(x_device)
+                    pred_val = teacher.to_prediction(out)
+                    chunk_preds_list.append(pred_val.cpu())
+            chunk_preds = torch.cat(chunk_preds_list, dim=0)
                 
             if limit_samples is not None:
                 chunk_preds = chunk_preds[:limit_samples]
