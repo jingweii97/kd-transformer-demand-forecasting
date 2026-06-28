@@ -11,7 +11,7 @@ store_filter: ""  # Empty means full dataset (30,490 series)
 # PyTorch Lightning Trainer device configurations
 accelerator: "gpu"
 devices: 1
-num_workers: 2
+num_workers: 4
 precision: "32"
 gradient_clip_val: 0.1
 
