@@ -12,13 +12,14 @@ from utils.config import load_config, save_config, save_metadata
 from utils.paths import resolve_path
 from utils.seed import set_seed
 from utils.logging import get_csv_logger
-from data.cache import load_from_cache, load_all_from_cache
+from data.cache import load_dataset_from_cache
 from data.dataset import build_timeseries_dataset
 from models.student import M5TransformerStudent
 
 def main():
     parser = argparse.ArgumentParser(description="Train Compact Transformer Student Model on M5 Dataset")
     parser.add_argument("--env", type=str, default="local", help="Environment configuration name")
+    parser.add_argument("--experiment", type=str, default=None, help="Experiment configuration name")
     parser.add_argument("--exp-name", type=str, default=None,
                         help="Experiment name directory (required — e.g. exp_full_phase1)")
     
@@ -47,7 +48,7 @@ def main():
         )
 
     # 1. Load Configurations
-    cfg = load_config(env_name=args.env)
+    cfg = load_config(env_name=args.env, experiment_name=args.experiment)
     
     # Apply debug flags directly to config environment settings
     if args.max_stores is not None:
@@ -67,17 +68,12 @@ def main():
     limit_val_batches = args.limit_val_batches if args.limit_val_batches is not None else cfg.student.limit_val_batches
 
     # 2. Load Preprocessed Data
-    # Single store (local dev / Phase-1): use store_filter directly.
-    # Full dataset (Phase-2, store_filter empty): concatenate all per-store Parquet files.
     from utils.paths import get_dataset_dir
     ds_dir = get_dataset_dir(cfg)
-    if cfg.environment.store_filter:
-        df = load_from_cache(
-            artifacts_dir=ds_dir,
-            store_filter=cfg.environment.store_filter
-        )
-    else:
-        df = load_all_from_cache(artifacts_dir=ds_dir)
+    df = load_dataset_from_cache(
+        artifacts_dir=ds_dir,
+        store_filter=cfg.environment.store_filter
+    )
     if df is None:
         raise FileNotFoundError(
             f"Preprocessed cache not found for store filter: '{cfg.environment.store_filter}'. "

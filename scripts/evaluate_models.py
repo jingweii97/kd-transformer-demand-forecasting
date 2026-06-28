@@ -13,7 +13,7 @@ import time
 from utils.config import load_config, save_config, save_metadata
 from utils.paths import resolve_path
 from utils.seed import set_seed
-from data.cache import load_from_cache, load_all_from_cache
+from data.cache import load_from_cache, load_dataset_from_cache, resolve_stores
 from data.dataset import build_timeseries_dataset
 from models.student import M5TransformerStudent
 
@@ -211,6 +211,7 @@ def compute_mase(actuals_slice, forecasts_slice, scales_array):
 def main():
     parser = argparse.ArgumentParser(description="Evaluate M5 Models on ID and OOD splits")
     parser.add_argument("--env", type=str, default="local", help="Environment configuration name")
+    parser.add_argument("--experiment", type=str, default=None, help="Experiment configuration name")
     parser.add_argument("--exp-name", type=str, default=None,
                         help="Experiment name (required — e.g. exp_full_phase1)")
     
@@ -232,14 +233,14 @@ def main():
         )
 
     # 1. Load Configurations
-    cfg = load_config(env_name=args.env)
+    cfg = load_config(env_name=args.env, experiment_name=args.experiment)
     set_seed(cfg.environment.seed)
 
     # Determine checkpoint paths, with defaults in outputs_dir
     outputs_dir = resolve_path(cfg.environment.outputs_dir)
     
     from utils.paths import find_checkpoint, get_dataset_dir
-
+ 
     teacher_chk = args.teacher_checkpoint or cfg.evaluation.teacher_checkpoint
     if not teacher_chk:
         teacher_chk = find_checkpoint(
@@ -272,14 +273,10 @@ def main():
 
     # 2. Load Preprocessed Data
     ds_dir = get_dataset_dir(cfg)
-    if cfg.environment.store_filter:
-        df = load_from_cache(
-            artifacts_dir=ds_dir,
-            store_filter=cfg.environment.store_filter
-        )
-    else:
-        df = load_all_from_cache(artifacts_dir=ds_dir)
-        
+    df = load_dataset_from_cache(
+        artifacts_dir=ds_dir,
+        store_filter=cfg.environment.store_filter
+    )
     if df is None:
         raise FileNotFoundError(
             f"Preprocessed cache not found for store filter: '{cfg.environment.store_filter}'. "
@@ -336,8 +333,7 @@ def main():
         from data.cache import STORES
         
         # Determine the stores to load
-        store_filter = cfg.environment.store_filter
-        stores = [store_filter] if store_filter else list(STORES)
+        stores = resolve_stores(cfg.environment.store_filter)
         
         max_stores = getattr(cfg.environment, "max_stores", None)
         if max_stores is not None:

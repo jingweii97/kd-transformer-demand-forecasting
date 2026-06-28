@@ -8,7 +8,7 @@ import pickle
 import pandas as pd
 import numpy as np
 from utils.paths import resolve_path
-from data.cache import load_from_cache, STORES
+from data.cache import load_from_cache, STORES, resolve_stores
 
 class StorePartitionedDataset(IterableDataset):
     def __init__(self, base_dataset, cfg, batch_size, is_train=True, max_idx=None, predict=True, shuffle=True, partition_manager=None):
@@ -23,8 +23,7 @@ class StorePartitionedDataset(IterableDataset):
         self.partition_manager = partition_manager
         
         # Determine the stores to load
-        store_filter = cfg.environment.store_filter
-        self.stores = [store_filter] if store_filter else list(STORES)
+        self.stores = resolve_stores(cfg.environment.store_filter)
 
     def __iter__(self):
         import gc

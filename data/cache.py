@@ -197,3 +197,45 @@ def load_all_from_cache(artifacts_dir):
     )
 
     return df
+
+
+def resolve_stores(store_filter):
+    """
+    Resolves a store_filter string (e.g. 'CA_1', 'TX', or '') into a list of store IDs.
+    - If store_filter is empty/None: returns all STORES.
+    - If store_filter is a specific store name in STORES: returns [store_filter].
+    - If store_filter matches a state prefix (CA, TX, WI): returns matching stores.
+    """
+    if not store_filter:
+        return list(STORES)
+    if store_filter in STORES:
+        return [store_filter]
+    matched = [s for s in STORES if s.startswith(store_filter)]
+    if matched:
+        return matched
+    raise ValueError(f"Unknown store or state filter: {store_filter}")
+
+
+def load_dataset_from_cache(artifacts_dir, store_filter):
+    """
+    Loads preprocessed DataFrame for resolved stores. Concatenates them for
+    base dataset/encoder fitting.
+    """
+    stores = resolve_stores(store_filter)
+    if len(stores) == len(STORES):
+        return load_all_from_cache(artifacts_dir)
+        
+    dfs = []
+    for s in stores:
+        part_df = load_from_cache(artifacts_dir, s)
+        if part_df is not None:
+            dfs.append(part_df)
+    if not dfs:
+        return None
+    
+    df = pd.concat(dfs, ignore_index=True)
+    assert (
+        df.groupby("id")["time_idx"].is_monotonic_increasing.all()
+    ), "time_idx is not monotonically increasing per group after concat."
+    return df
+

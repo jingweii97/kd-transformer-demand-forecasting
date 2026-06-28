@@ -1,0 +1,11 @@
+# Preliminary study: TX state only, stride=7, minimal compute
+store_filter: "TX"
+window_stride: 7
+
+teacher:
+  epochs: 2
+  patience: 1
+
+student:
+  epochs: 2
+  patience: 1

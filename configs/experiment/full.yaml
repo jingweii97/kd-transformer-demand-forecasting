@@ -1,0 +1,9 @@
+# Final thesis: all states, stride=7, full epoch budgets
+store_filter: ""
+window_stride: 7
+
+teacher:
+  epochs: 30
+
+student:
+  epochs: 50

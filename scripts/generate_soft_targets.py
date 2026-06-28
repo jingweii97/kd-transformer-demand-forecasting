@@ -12,13 +12,14 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.config import load_config, get_git_commit_hash
 from utils.paths import resolve_path
 from utils.seed import set_seed
-from data.cache import load_from_cache, load_all_from_cache, FEATURE_VERSION
+from data.cache import load_from_cache, load_dataset_from_cache, resolve_stores, FEATURE_VERSION
 from data.dataset import build_timeseries_dataset
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 
 def main():
     parser = argparse.ArgumentParser(description="Generate and Save TFT Teacher Forecasts as Soft Targets")
     parser.add_argument("--env", type=str, default="local", help="Environment configuration name")
+    parser.add_argument("--experiment", type=str, default=None, help="Experiment configuration name")
     parser.add_argument("--checkpoint-path", type=str, required=True, help="Path to the trained TFT teacher checkpoint")
     parser.add_argument("--exp-name", type=str, default=None,
                         help="Experiment name (required — e.g. exp_full_phase1)")
@@ -35,7 +36,7 @@ def main():
         )
 
     # Load Configurations
-    cfg = load_config(env_name=args.env)
+    cfg = load_config(env_name=args.env, experiment_name=args.experiment)
     set_seed(cfg.environment.seed)
 
     # Determine default max day for soft target generation
@@ -48,17 +49,12 @@ def main():
     output_file = os.path.join(output_dir, f"{args.exp_name}.pt")
 
     # 1. Load Preprocessed Data
-    # Single store (local dev / Phase-1): use store_filter directly.
-    # Full dataset (Phase-2, store_filter empty): concatenate all per-store Parquet files.
     from utils.paths import get_dataset_dir
     ds_dir = get_dataset_dir(cfg)
-    if cfg.environment.store_filter:
-        df = load_from_cache(
-            artifacts_dir=ds_dir,
-            store_filter=cfg.environment.store_filter
-        )
-    else:
-        df = load_all_from_cache(artifacts_dir=ds_dir)
+    df = load_dataset_from_cache(
+        artifacts_dir=ds_dir,
+        store_filter=cfg.environment.store_filter
+    )
     if df is None:
         raise FileNotFoundError(
             f"Preprocessed cache not found for store filter: '{cfg.environment.store_filter}'. "
@@ -82,8 +78,7 @@ def main():
     print(f"Generating teacher forecasts store-by-store up to Day {max_day}...")
     
     # Determine the stores to load
-    store_filter = cfg.environment.store_filter
-    stores = [store_filter] if store_filter else list(STORES)
+    stores = resolve_stores(cfg.environment.store_filter)
     
     # Debug limits
     max_stores = getattr(cfg.environment, "max_stores", None)
@@ -200,7 +195,7 @@ def main():
     provenance = {
         "exp_name": args.exp_name,
         "checkpoint_path": str(checkpoint_path_abs),
-        "store_filter": store_filter or "full",
+        "store_filter": cfg.environment.store_filter or "full",
         "max_day": int(max_day),
         "batch_size": int(args.batch_size),
         "feature_version": int(FEATURE_VERSION),

@@ -22,10 +22,11 @@ class Config:
                 d[key] = value
         return d
 
-def load_config(env_name="local", config_dir="configs"):
+def load_config(env_name="local", experiment_name=None, config_dir="configs"):
     """
     Loads dataset, evaluation, teacher, student, and environment configurations,
     merges them into a Config namespace object, and performs schema validation.
+    Supports optional experiment configuration overrides.
     """
     config_dir_abs = resolve_path(config_dir)
     
@@ -63,6 +64,23 @@ def load_config(env_name="local", config_dir="configs"):
         "environment": env_cfg
     }
     
+    # Apply experiment overrides explicitly if requested
+    if experiment_name:
+        exp_path = os.path.join(config_dir_abs, "experiment", f"{experiment_name}.yaml")
+        if not os.path.exists(exp_path):
+            raise FileNotFoundError(f"Experiment configuration file not found: {exp_path}")
+        with open(exp_path, 'r') as f:
+            exp_cfg = yaml.safe_load(f) or {}
+            
+        if "store_filter" in exp_cfg:
+            merged_dict["environment"]["store_filter"] = exp_cfg["store_filter"]
+        if "window_stride" in exp_cfg:
+            merged_dict["dataset"]["window_stride"] = exp_cfg["window_stride"]
+        if "teacher" in exp_cfg and isinstance(exp_cfg["teacher"], dict):
+            merged_dict["teacher"].update(exp_cfg["teacher"])
+        if "student" in exp_cfg and isinstance(exp_cfg["student"], dict):
+            merged_dict["student"].update(exp_cfg["student"])
+            
     cfg = Config(merged_dict)
     validate_config(cfg)
     return cfg
