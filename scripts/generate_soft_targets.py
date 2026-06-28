@@ -92,6 +92,8 @@ def main():
     min_idx = 1
     
     forecast_horizon = cfg.dataset.prediction_window
+    chunk_size = getattr(cfg.environment, "soft_targets_chunk_size", 500)
+    print(f"Using soft targets chunk size: {chunk_size}")
 
     for store in stores:
         print(f"Generating forecasts for store: {store}")
@@ -115,64 +117,95 @@ def main():
                 
         if len(df_part_sliced) == 0:
             continue
-            
-        # Construct standard TimeSeriesDataSet from training_data base dataset
-        part_ds = TimeSeriesDataSet.from_dataset(
-            training_data,
-            df_part_sliced,
-            predict=False,  # sliding windows
-            stop_randomization=True
-        )
-        del df_part_sliced
-        
-        # Create standard DataLoader
-        part_loader = part_ds.to_dataloader(
-            train=False,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=cfg.environment.num_workers
-        )
-        
-        # Generate predictions for this partition
-        with torch.no_grad():
-            part_preds = teacher.predict(
-                part_loader,
-                mode="prediction",
-                trainer_kwargs={
-                    "accelerator": "cuda" if torch.cuda.is_available() else "cpu",
-                    "devices": 1
-                }
-            )
-            
-        # Limit predictions in debug mode
-        max_batches_per_store = getattr(cfg.environment, "max_batches_per_store", None)
-        if max_batches_per_store is not None:
-            limit_samples = max_batches_per_store * args.batch_size
-            part_preds = part_preds[:limit_samples]
-            part_decoded = part_ds.decoded_index.head(limit_samples)
-        else:
-            part_decoded = part_ds.decoded_index
-            
-        group_names = part_decoded['id'].values
-        start_times = part_decoded['time_idx_first_prediction'].values
-        
-        # Map global group names to codes
+
+        # Resolve all unique groups and mapping for the entire store partition first
         group_encoder = training_data._categorical_encoders['id']
-        group_codes = group_encoder.transform(group_names)
+        group_names_all = df_part_sliced['id'].unique()
+        group_codes_all = group_encoder.transform(group_names_all)
         
-        # Determine unique global group IDs in this store
-        unique_groups = sorted(list(set(group_codes)))
+        unique_groups = sorted(list(set(group_codes_all)))
         group_to_local = {g: idx for idx, g in enumerate(unique_groups)}
-        local_codes = np.array([group_to_local[g] for g in group_codes])
         
-        # Allocate store local tensor: (num_store_groups, max_day + 1, forecast_horizon)
+        # Allocate store local lookup tensor: (num_store_groups, max_day + 1, forecast_horizon)
         store_soft_targets = torch.zeros((len(unique_groups), max_day + 1, forecast_horizon), dtype=torch.float32)
         
-        # Vectorized assignment
-        local_codes_tensor = torch.tensor(local_codes, dtype=torch.long)
-        start_times_tensor = torch.tensor(start_times, dtype=torch.long)
-        store_soft_targets[local_codes_tensor, start_times_tensor] = part_preds.cpu()
+        # Chunk items to control TimeSeriesDataSet RAM footprint
+        unique_items = df_part_sliced['item_id'].unique()
+        batches_processed = 0
+        max_batches_per_store = getattr(cfg.environment, "max_batches_per_store", None)
         
+        for i in range(0, len(unique_items), chunk_size):
+            chunk_items = unique_items[i : i + chunk_size]
+            df_chunk = df_part_sliced[df_part_sliced['item_id'].isin(chunk_items)].copy()
+            if len(df_chunk) == 0:
+                continue
+                
+            # Construct dataset for chunk
+            chunk_ds = TimeSeriesDataSet.from_dataset(
+                training_data,
+                df_chunk,
+                predict=False,  # sliding windows
+                stop_randomization=True
+            )
+            del df_chunk
+            
+            # Create DataLoader for chunk
+            chunk_loader = chunk_ds.to_dataloader(
+                train=False,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=cfg.environment.num_workers
+            )
+            
+            num_batches = len(chunk_loader)
+            if max_batches_per_store is not None:
+                if batches_processed >= max_batches_per_store:
+                    del chunk_ds
+                    del chunk_loader
+                    break
+                if batches_processed + num_batches > max_batches_per_store:
+                    limit_samples = (max_batches_per_store - batches_processed) * args.batch_size
+                else:
+                    limit_samples = None
+            else:
+                limit_samples = None
+            
+            # Generate predictions for this chunk
+            with torch.no_grad():
+                chunk_preds = teacher.predict(
+                    chunk_loader,
+                    mode="prediction",
+                    trainer_kwargs={
+                        "accelerator": "cuda" if torch.cuda.is_available() else "cpu",
+                        "devices": 1
+                    }
+                )
+                
+            if limit_samples is not None:
+                chunk_preds = chunk_preds[:limit_samples]
+                chunk_decoded = chunk_ds.decoded_index.head(limit_samples)
+            else:
+                chunk_decoded = chunk_ds.decoded_index
+                
+            chunk_group_names = chunk_decoded['id'].values
+            chunk_start_times = chunk_decoded['time_idx_first_prediction'].values
+            
+            # Map codes and assign directly to the store-local tensor
+            chunk_group_codes = group_encoder.transform(chunk_group_names)
+            chunk_local_codes = np.array([group_to_local[g] for g in chunk_group_codes])
+            
+            local_codes_tensor = torch.tensor(chunk_local_codes, dtype=torch.long)
+            start_times_tensor = torch.tensor(chunk_start_times, dtype=torch.long)
+            store_soft_targets[local_codes_tensor, start_times_tensor] = chunk_preds.cpu()
+            
+            batches_processed += num_batches
+            
+            # Reclaim chunk memory immediately
+            del chunk_ds
+            del chunk_loader
+            del chunk_preds
+            gc.collect()
+            
         # Save soft targets store partition
         output_file = os.path.join(output_dir, f"{args.exp_name}_{store}.pt")
         print(f"Saving soft targets partition to: {output_file}")
@@ -198,10 +231,7 @@ def main():
         with open(provenance_path, "w") as _pf:
             json.dump(provenance, _pf, indent=4)
             
-        # Reclaim memory
-        del part_loader
-        del part_ds
-        del part_preds
+        # Reclaim store memory
         del store_soft_targets
         gc.collect()
 
