@@ -195,11 +195,13 @@ def main():
     )
 
     # 8. Set up Trainer
+    gradient_clip_val = getattr(cfg.environment, "gradient_clip_val", 0.1)
     trainer = pl.Trainer(
         max_epochs=epochs,
         accelerator=cfg.environment.accelerator,
         devices=cfg.environment.devices,
         precision=cfg.environment.precision,
+        gradient_clip_val=gradient_clip_val,
         callbacks=[early_stop_callback, checkpoint_callback],
         logger=logger,
         limit_train_batches=limit_train_batches,

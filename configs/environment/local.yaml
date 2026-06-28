@@ -13,5 +13,6 @@ accelerator: "cpu"
 devices: "auto"
 num_workers: 0
 precision: 32
+gradient_clip_val: 0.1
 
 seed: 42

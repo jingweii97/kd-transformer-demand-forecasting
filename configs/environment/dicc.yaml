@@ -13,5 +13,6 @@ accelerator: "gpu"
 devices: 1
 num_workers: 4
 precision: 16
+gradient_clip_val: 0.1
 
 seed: 42
