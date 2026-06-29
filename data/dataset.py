@@ -67,20 +67,25 @@ class StorePartitionedDataset(IterableDataset):
             store_soft_targets = None
             global_to_local = None
             if self.is_train and getattr(self.cfg.student, "kd", False) and self.exp_name is not None:
-                # Resolve soft targets path for the current store
-                exp_dir = getattr(self.cfg.environment, "experiment_artifacts_dir", None)
-                if exp_dir is not None:
-                    from utils.paths import get_experiment_dir
-                    exp_art_dir = get_experiment_dir(self.cfg)
-                    path1 = os.path.join(exp_art_dir, "soft_targets", f"{self.exp_name}_{store}.pt")
-                    path2 = os.path.join(exp_art_dir, "outputs", "soft_targets", f"{self.exp_name}_{store}.pt")
-                    if os.path.exists(path1):
-                        st_path = path1
-                    else:
-                        st_path = path2
+                # First check whether cfg.student.soft_targets_path exists and is a directory
+                soft_targets_path = getattr(self.cfg.student, "soft_targets_path", None)
+                if soft_targets_path and os.path.isdir(resolve_path(soft_targets_path)):
+                    st_path = os.path.join(resolve_path(soft_targets_path), f"{self.exp_name}_{store}.pt")
                 else:
-                    artifacts_dir = resolve_path(self.cfg.environment.artifacts_dir)
-                    st_path = os.path.join(artifacts_dir, "soft_targets", f"{self.exp_name}_{store}.pt")
+                    # Resolve soft targets path for the current store using fallback logic
+                    exp_dir = getattr(self.cfg.environment, "experiment_artifacts_dir", None)
+                    if exp_dir is not None:
+                        from utils.paths import get_experiment_dir
+                        exp_art_dir = get_experiment_dir(self.cfg)
+                        path1 = os.path.join(exp_art_dir, "soft_targets", f"{self.exp_name}_{store}.pt")
+                        path2 = os.path.join(exp_art_dir, "outputs", "soft_targets", f"{self.exp_name}_{store}.pt")
+                        if os.path.exists(path1):
+                            st_path = path1
+                        else:
+                            st_path = path2
+                    else:
+                        artifacts_dir = resolve_path(self.cfg.environment.artifacts_dir)
+                        st_path = os.path.join(artifacts_dir, "soft_targets", f"{self.exp_name}_{store}.pt")
                 
                 print(f"Loading pre-computed teacher forecasts for store {store} from: {st_path}")
                 if os.path.exists(st_path):

@@ -137,8 +137,37 @@ def main():
         
         # Check if per-store target files exist instead of a single global file
         use_per_store_targets = False
-        if not soft_targets_path:
-            # Look for a representative per-store file (e.g. TX_1) to determine if per-store partitions are used
+        
+        if soft_targets_path:
+            resolved_p = resolve_path(soft_targets_path)
+            if os.path.isdir(resolved_p):
+                # Verify all expected per-store files (for all stores that will be streamed) exist
+                from data.cache import resolve_stores
+                stores_to_check = resolve_stores(cfg.environment.store_filter)
+                missing_stores = []
+                for store in stores_to_check:
+                    p = os.path.join(resolved_p, f"{args.exp_name}_{store}.pt")
+                    if not os.path.exists(p):
+                        missing_stores.append(f"{args.exp_name}_{store}.pt")
+                if missing_stores:
+                    raise FileNotFoundError(
+                        f"Soft targets directory '{resolved_p}' is missing the following expected "
+                        f"per-store file(s) for experiment '{args.exp_name}': {', '.join(missing_stores)}. "
+                        f"Expected files for all streamed stores under this experiment."
+                    )
+                use_per_store_targets = True
+                cfg.student.soft_targets_path = resolved_p
+            elif os.path.isfile(resolved_p):
+                # Legacy global file path mode
+                pass
+            else:
+                raise FileNotFoundError(
+                    f"Provided soft targets path '{resolved_p}' does not exist as a file or directory. "
+                    f"Expected a legacy global '.pt' file or a directory containing "
+                    f"'{args.exp_name}_<store>.pt' files."
+                )
+        else:
+            # Fallback path if no path is provided via CLI: check default check directories
             from data.cache import STORES
             exp_dir = getattr(cfg.environment, "experiment_artifacts_dir", None)
             if exp_dir is not None:
@@ -149,15 +178,19 @@ def main():
                 artifacts_dir = resolve_path(cfg.environment.artifacts_dir)
                 check_dirs = [os.path.join(artifacts_dir, "soft_targets")]
             
+            resolved_dir = None
             for store in STORES:
                 for d in check_dirs:
                     p = os.path.join(d, f"{args.exp_name}_{store}.pt")
                     if os.path.exists(p):
                         use_per_store_targets = True
+                        resolved_dir = d
                         break
                 if use_per_store_targets:
                     break
-        
+            if use_per_store_targets:
+                cfg.student.soft_targets_path = resolved_dir
+
         if use_per_store_targets:
             print(f"Per-store soft targets detected for experiment '{args.exp_name}'. Dataloader will stream them partition-by-partition.")
         else:
