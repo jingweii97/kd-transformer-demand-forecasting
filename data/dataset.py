@@ -89,7 +89,7 @@ class StorePartitionedDataset(IterableDataset):
                 
                 print(f"Loading pre-computed teacher forecasts for store {store} from: {st_path}")
                 if os.path.exists(st_path):
-                    st_data = torch.load(st_path, map_location="cpu")
+                    st_data = torch.load(st_path, map_location="cpu", weights_only=False)
                     unique_groups = st_data["unique_groups"]
                     store_soft_targets = st_data["tensor"]
                     

@@ -222,7 +222,7 @@ def main():
                     "Run generate_soft_targets.py first."
                 )
             
-            soft_targets = torch.load(soft_targets_path_abs)
+            soft_targets = torch.load(soft_targets_path_abs, weights_only=False)
             print(f"Loaded soft targets tensor of shape: {soft_targets.shape}")
     
             # A-3: Validate tensor dimensions against the fitted dataset and config.

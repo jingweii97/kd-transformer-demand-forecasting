@@ -67,7 +67,7 @@ def main():
     print(f"Loading precomputed soft targets from: {soft_targets_path_abs}")
     if not os.path.exists(soft_targets_path_abs):
         raise FileNotFoundError(f"Soft targets file not found at: {soft_targets_path_abs}")
-    soft_targets = torch.load(soft_targets_path_abs)
+    soft_targets = torch.load(soft_targets_path_abs, weights_only=False)
 
     # 4. Load Teacher model checkpoint
     checkpoint_path_abs = resolve_path(args.checkpoint_path)
