@@ -208,6 +208,69 @@ def compute_mase(actuals_slice, forecasts_slice, scales_array):
     mase_per_series = mae_per_series / scales_array
     return np.mean(mase_per_series)
 
+def find_latest_checkpoint_in_dir(directory, pattern="*.ckpt"):
+    import glob
+    if not os.path.exists(directory):
+        return None
+    files = glob.glob(os.path.join(directory, pattern))
+    if not files:
+        files = glob.glob(os.path.join(directory, "*.ckpt"))
+    if not files:
+        return None
+    # Sort files by modification time (most recent first)
+    files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    return files[0]
+
+def resolve_model_checkpoint(cli_path, config_path, outputs_dir, rel_subpath, checkpoint_pattern, cfg):
+    # Priority 1: CLI arguments
+    if cli_path:
+        resolved = resolve_path(cli_path)
+        if os.path.exists(resolved):
+            return resolved
+        raise FileNotFoundError(f"CLI-specified checkpoint not found at: '{resolved}'")
+        
+    # Priority 2: Configuration
+    if config_path:
+        resolved = resolve_path(config_path)
+        if os.path.exists(resolved):
+            return resolved
+        raise FileNotFoundError(f"Config-specified checkpoint not found at: '{resolved}'")
+        
+    # Priority 3: Automatic discovery
+    # A. Search in experiment_artifacts_dir if configured (e.g. Workflow B - mounted datasets)
+    exp_dir = getattr(cfg.environment, "experiment_artifacts_dir", None)
+    if exp_dir is not None:
+        abs_exp_dir = resolve_path(exp_dir)
+        if os.path.exists(abs_exp_dir):
+            p1 = os.path.abspath(os.path.join(abs_exp_dir, rel_subpath))
+            if os.path.exists(p1):
+                return p1
+            p2 = os.path.abspath(os.path.join(abs_exp_dir, "outputs", rel_subpath))
+            if os.path.exists(p2):
+                return p2
+            latest = find_latest_checkpoint_in_dir(os.path.dirname(p1), checkpoint_pattern)
+            if latest:
+                return latest
+            latest = find_latest_checkpoint_in_dir(os.path.dirname(p2), checkpoint_pattern)
+            if latest:
+                return latest
+                
+    # B. Search locally in outputs_dir (e.g. Workflow A - development outputs)
+    local_dir = os.path.abspath(os.path.join(outputs_dir, os.path.dirname(rel_subpath)))
+    latest = find_latest_checkpoint_in_dir(local_dir, checkpoint_pattern)
+    if latest:
+        return latest
+        
+    # Fallback to the default expected path in outputs_dir
+    fallback_path = os.path.abspath(os.path.join(outputs_dir, rel_subpath))
+    if os.path.exists(fallback_path):
+        return fallback_path
+        
+    raise FileNotFoundError(
+        f"Checkpoint for '{rel_subpath}' could not be resolved. Checked CLI, configuration, "
+        f"experiment_artifacts_dir, and local outputs directory '{local_dir}'."
+    )
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate M5 Models on ID and OOD splits")
     parser.add_argument("--env", type=str, default="local", help="Environment configuration name")
@@ -239,37 +302,39 @@ def main():
     # Determine checkpoint paths, with defaults in outputs_dir
     outputs_dir = resolve_path(cfg.environment.outputs_dir)
     
-    from utils.paths import find_checkpoint, get_dataset_dir
+    from utils.paths import get_dataset_dir
  
-    teacher_chk = args.teacher_checkpoint or cfg.evaluation.teacher_checkpoint
-    if not teacher_chk:
-        teacher_chk = find_checkpoint(
-            cfg,
-            os.path.join(outputs_dir, "teacher", args.exp_name, "best_tft_teacher.ckpt"),
-            f"teacher/{args.exp_name}/best_tft_teacher.ckpt"
-        )
-    else:
-        teacher_chk = resolve_path(teacher_chk)
+    teacher_chk = resolve_model_checkpoint(
+        args.teacher_checkpoint,
+        cfg.evaluation.teacher_checkpoint,
+        outputs_dir,
+        os.path.join("teacher", args.exp_name, "best_tft_teacher.ckpt"),
+        "best_tft_teacher*.ckpt",
+        cfg
+    )
         
-    student_nokd_chk = args.student_nokd_checkpoint or cfg.evaluation.student_nokd_checkpoint
-    if not student_nokd_chk:
-        student_nokd_chk = find_checkpoint(
-            cfg,
-            os.path.join(outputs_dir, "student", "no_kd", args.exp_name, "best_student.ckpt"),
-            f"student/no_kd/{args.exp_name}/best_student.ckpt"
-        )
-    else:
-        student_nokd_chk = resolve_path(student_nokd_chk)
+    student_nokd_chk = resolve_model_checkpoint(
+        args.student_nokd_checkpoint,
+        cfg.evaluation.student_nokd_checkpoint,
+        outputs_dir,
+        os.path.join("student", "no_kd", args.exp_name, "best_student.ckpt"),
+        "best_student*.ckpt",
+        cfg
+    )
         
-    student_kd_chk = args.student_kd_checkpoint or cfg.evaluation.student_kd_checkpoint
-    if not student_kd_chk:
-        student_kd_chk = find_checkpoint(
-            cfg,
-            os.path.join(outputs_dir, "student", "kd", args.exp_name, "best_student.ckpt"),
-            f"student/kd/{args.exp_name}/best_student.ckpt"
-        )
-    else:
-        student_kd_chk = resolve_path(student_kd_chk)
+    student_kd_chk = resolve_model_checkpoint(
+        args.student_kd_checkpoint,
+        cfg.evaluation.student_kd_checkpoint,
+        outputs_dir,
+        os.path.join("student", "kd", args.exp_name, "best_student.ckpt"),
+        "best_student*.ckpt",
+        cfg
+    )
+
+    print("\nResolved checkpoints\n")
+    print(f"Teacher:\n    {teacher_chk}\n")
+    print(f"Student (No KD):\n    {student_nokd_chk}\n")
+    print(f"Student (KD):\n    {student_kd_chk}\n")
 
     # 2. Load Preprocessed Data
     ds_dir = get_dataset_dir(cfg)
