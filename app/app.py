@@ -672,7 +672,7 @@ elif selected_tab == "🔬 Research Evaluation":
     col_bench1, col_bench2 = st.columns(2)
     
     with col_bench1:
-        st.markdown("<p style='font-weight: bold; margin-bottom:5px;'>🏆 Model Benchmark (Entire Preliminary Test Set)</p>", unsafe_allow_html=True)
+        st.markdown("<p style='font-weight: bold; margin-bottom:5px;'>🏆 Overall Model Benchmark (Entire Preliminary Test Set)</p>", unsafe_allow_html=True)
         st.caption("Global benchmarks calculated across the entire 30,490 time series in M5 evaluation:")
         
         benchmark_data = [
@@ -758,6 +758,15 @@ elif selected_tab == "🔬 Research Evaluation":
             
         df_sku_evals = pd.DataFrame(sku_evals).set_index("Model")
         
+        # Tab 2 Chart model visibility checkboxes
+        st.markdown("<p style='font-weight: bold; margin-bottom: 5px;'>Model Visibility Toggles</p>", unsafe_allow_html=True)
+        cb_cols = st.columns(5)
+        show_actual = cb_cols[0].checkbox("Actual Sales", value=True, key="t2_actual")
+        show_naive = cb_cols[1].checkbox("Seasonal Naive", value=True, key="t2_naive")
+        show_teacher = cb_cols[2].checkbox("TFT Teacher", value=True, key="t2_teacher")
+        show_student = cb_cols[3].checkbox("Transformer Student", value=True, key="t2_student")
+        show_student_kd = cb_cols[4].checkbox("Transformer Student + KD", value=True, key="t2_student_kd")
+        
         # Plot multi-model comparison chart with Ground Truth Actuals
         eval_fig = go.Figure()
         
@@ -771,49 +780,54 @@ elif selected_tab == "🔬 Research Evaluation":
         ))
         
         # Ground Truth Actuals - High contrast crimson `#ff4b4b`
-        eval_fig.add_trace(go.Scatter(
-            x=cache["forecast_dates"],
-            y=act,
-            name="Actual",
-            line=dict(color="#ff4b4b", width=4),
-            mode="lines"
-        ))
+        if show_actual:
+            eval_fig.add_trace(go.Scatter(
+                x=cache["forecast_dates"],
+                y=act,
+                name="Actual",
+                line=dict(color="#ff4b4b", width=4),
+                mode="lines"
+            ))
         
         # Seasonal Naive
-        eval_fig.add_trace(go.Scatter(
-            x=cache["forecast_dates"],
-            y=cache["naive_matrix"][sku_i],
-            name="Seasonal",
-            line=dict(color="#f59e0b", width=2, dash="dot"),
-            mode="lines"
-        ))
+        if show_naive:
+            eval_fig.add_trace(go.Scatter(
+                x=cache["forecast_dates"],
+                y=cache["naive_matrix"][sku_i],
+                name="Seasonal",
+                line=dict(color="#f59e0b", width=2, dash="dot"),
+                mode="lines"
+            ))
         
         # TFT Teacher
-        eval_fig.add_trace(go.Scatter(
-            x=cache["forecast_dates"],
-            y=cache["teacher_matrix"][sku_i],
-            name="Teacher",
-            line=dict(color="#3b82f6", width=2.5),
-            mode="lines"
-        ))
+        if show_teacher:
+            eval_fig.add_trace(go.Scatter(
+                x=cache["forecast_dates"],
+                y=cache["teacher_matrix"][sku_i],
+                name="Teacher",
+                line=dict(color="#3b82f6", width=2.5),
+                mode="lines"
+            ))
         
         # Student No KD
-        eval_fig.add_trace(go.Scatter(
-            x=cache["forecast_dates"],
-            y=cache["student_nokd_matrix"][sku_i],
-            name="Student",
-            line=dict(color="#ec4899", width=2),
-            mode="lines"
-        ))
+        if show_student:
+            eval_fig.add_trace(go.Scatter(
+                x=cache["forecast_dates"],
+                y=cache["student_nokd_matrix"][sku_i],
+                name="Student",
+                line=dict(color="#ec4899", width=2),
+                mode="lines"
+            ))
         
         # Student KD
-        eval_fig.add_trace(go.Scatter(
-            x=cache["forecast_dates"],
-            y=cache["student_kd_matrix"][sku_i],
-            name="Student + KD",
-            line=dict(color="#10b981", width=2.5),
-            mode="lines"
-        ))
+        if show_student_kd:
+            eval_fig.add_trace(go.Scatter(
+                x=cache["forecast_dates"],
+                y=cache["student_kd_matrix"][sku_i],
+                name="Student + KD",
+                line=dict(color="#10b981", width=2.5),
+                mode="lines"
+            ))
         
         eval_fig.add_vline(
             x=cache["forecast_dates"][0],
@@ -838,7 +852,7 @@ elif selected_tab == "🔬 Research Evaluation":
 
         col_eval1, col_eval2 = st.columns([1, 2])
         with col_eval1:
-            st.markdown("<p style='font-weight: bold; margin-bottom:5px;'>🎯 Forecast Accuracy (Current Selected SKU)</p>", unsafe_allow_html=True)
+            st.markdown("<p style='font-weight: bold; margin-bottom:5px;'>🎯 Forecast Accuracy (Selected SKU)</p>", unsafe_allow_html=True)
             st.table(df_sku_evals)
             
         with col_eval2:
