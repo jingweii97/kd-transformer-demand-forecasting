@@ -26,5 +26,6 @@ artifacts/
 
 # Experiment outputs and checkpoints
 outputs/
+kaggle-output/ 
 lightning_logs/
 candidate_windows_metrics.csv
