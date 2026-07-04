@@ -373,6 +373,7 @@ def main():
     mase_scales_dict = compute_mase_scales(df_train, train_end)
 
     results = []
+    diagnostics_dict = {}
 
     # Loop ID and OOD windows
     for test_name, start_day, end_day in [
@@ -383,12 +384,14 @@ def main():
         
         # Sliced test actuals and categoricals for indexing
         df_test_gt = df[(df['time_idx'] >= start_day) & (df['time_idx'] <= end_day)].copy()
+        df_test_gt['id'] = df_test_gt['id'].astype(str)
         df_test_gt = df_test_gt.sort_values(by=['id', 'time_idx']).reset_index(drop=True)
         
         # 5.1 Seasonal Naive Predictions
         print("Generating forecasts from Seasonal Naive...")
         start_t = time.perf_counter()
         df_naive_source = df[(df['time_idx'] >= (start_day - 28)) & (df['time_idx'] < start_day)].copy()
+        df_naive_source['id'] = df_naive_source['id'].astype(str)
         df_naive_source = df_naive_source.sort_values(by=['id', 'time_idx']).reset_index(drop=True)
         naive_time = time.perf_counter() - start_t
         
@@ -508,6 +511,7 @@ def main():
         naive_forecasts = df_naive_source['sales'].values.reshape(-1, 28)
         
         # Sort predictions alphabetically by id to match the filtered df_test_gt
+        concatenated_decoded['id'] = concatenated_decoded['id'].astype(str)
         concatenated_decoded['pred_idx'] = np.arange(len(concatenated_decoded))
         decoded_sorted = concatenated_decoded.sort_values(by=['id', 'time_idx_first_prediction'])
         target_indices = decoded_sorted['pred_idx'].values
@@ -554,10 +558,15 @@ def main():
                 
                 # Compute metrics
                 mae, rmse, wape = compute_point_metrics(actuals_slice.flatten(), forecasts_slice.flatten())
-                wrmsse, _ = compute_hierarchical_wrmsse(df_test_gt_slice, df_preds_slice, weights_dict, scales_dict)
+                wrmsse, level_wrmsses = compute_hierarchical_wrmsse(df_test_gt_slice, df_preds_slice, weights_dict, scales_dict)
                 mase = compute_mase(actuals_slice, forecasts_slice, scales_array)
                 
                 print(f"    {slice_name:15s} -> WRMSSE: {wrmsse:.4f} | MAE: {mae:.4f} | RMSE: {rmse:.4f} | MASE: {mase:.4f} | WAPE: {wape:.4f}")
+                if slice_name == "Overall (1-28)":
+                    diagnostics_dict[(name, test_name)] = level_wrmsses
+                    print("      Hierarchy-Level Diagnostic WRMSSE:")
+                    for idx, lvl_val in enumerate(level_wrmsses, 1):
+                        print(f"        Level {idx:2d}: {lvl_val:.6f}")
                 
                 results.append({
                     "Window": test_name,
@@ -602,7 +611,10 @@ def main():
                 "MASE": float(df_m_w["MASE"].values[0]),
                 "MAE": float(df_m_w["MAE"].values[0]),
                 "Inference_Time_Sec": float(df_m_w["Inference_Time_Sec"].values[0]),
-                "Inference_Time_Per_1k_Sec": float(df_m_w["Inference_Time_Per_1k_Sec"].values[0])
+                "Inference_Time_Per_1k_Sec": float(df_m_w["Inference_Time_Per_1k_Sec"].values[0]),
+                "hierarchy_wrmsse_diagnostics": {
+                    f"Level_{idx}": float(val) for idx, val in enumerate(diagnostics_dict.get((m, w), []), 1)
+                }
             }
             
     save_metadata(
