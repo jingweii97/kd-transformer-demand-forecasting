@@ -12,7 +12,7 @@ store_filter: ""  # Empty means full dataset (30,490 series)
 accelerator: "gpu"
 devices: 1
 num_workers: 4
-precision: 16
+precision: "bf16-mixed"
 gradient_clip_val: 0.1
 
 seed: 42
