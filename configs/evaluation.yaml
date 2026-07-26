@@ -4,6 +4,7 @@ metrics:
   - "WRMSSE"
   - "MAE"
   - "RMSE"
+  - "MASE"
   - "WAPE"
 
 # Default paths for checkpoints (can be overridden via command line or environment configurations)

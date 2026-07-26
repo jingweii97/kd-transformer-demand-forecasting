@@ -4,6 +4,8 @@ window_stride: 7
 
 teacher:
   epochs: 30
+  patience: 5
 
 student:
   epochs: 50
+  patience: 5

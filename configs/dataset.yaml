@@ -10,14 +10,23 @@ window_stride: 7          # Sliding window step size; 1 = fully overlapping, 7 =
 splits:
   train:
     start: 1
-    end: 1857
+    end: 1359
   validation:
-    start: 1858
-    end: 1885
+    start: 1360
+    end: 1553
+  test_stream:
+    start: 1554
+    end: 1941
   id_test:
-    start: 1886
-    end: 1913
-  ood_test:
+    start: 1554
+    end: 1581
+  ood_test:                # Primary OOD evaluation split used by evaluate_models.py (Days 1819-1846)
+    start: 1819
+    end: 1846
+  event_ood_test:          # Domain alias for primary Event-driven OOD window (identical to ood_test)
+    start: 1819
+    end: 1846
+  extended_ood_test:       # Secondary OOD window for extended-horizon analysis (Days 1914-1941)
     start: 1914
     end: 1941
 

@@ -48,6 +48,10 @@ def main():
     parser.add_argument("--exp-name", type=str, default=None,
                         help="Experiment name directory (required — e.g. exp_full_phase1)")
     
+    # Resume options
+    parser.add_argument("--resume", action="store_true", help="Auto-resume training from last.ckpt in experiment directory")
+    parser.add_argument("--ckpt-path", type=str, default=None, help="Explicit path to checkpoint file to resume from")
+    
     # Overrides
     parser.add_argument("--kd", action="store_true", help="Enable teacher-student Knowledge Distillation (KD)")
     parser.add_argument("--no-kd", dest="kd", action="store_false", help="Disable teacher-student KD")
@@ -264,6 +268,21 @@ def main():
     save_config(cfg, config_save_path)
     print(f"Merged config saved to {config_save_path}")
 
+    # Resolve resume checkpoint path if requested
+    resume_ckpt_path = None
+    if args.ckpt_path:
+        resume_ckpt_path = resolve_path(args.ckpt_path)
+        if not os.path.exists(resume_ckpt_path):
+            raise FileNotFoundError(f"Specified checkpoint for resume not found at: {resume_ckpt_path}")
+        print(f"Resuming training from explicit checkpoint: {resume_ckpt_path}")
+    elif args.resume:
+        default_last = os.path.join(exp_dir, "last.ckpt")
+        if os.path.exists(default_last):
+            resume_ckpt_path = default_last
+            print(f"Auto-resuming training from latest checkpoint: {resume_ckpt_path}")
+        else:
+            raise FileNotFoundError(f"--resume flag passed, but 'last.ckpt' was not found in: {exp_dir}")
+
     # Set up Logger and Callbacks
     logger = get_csv_logger(cfg.environment.outputs_dir, model_mode, args.exp_name)
     
@@ -272,6 +291,7 @@ def main():
         monitor="val_loss",
         filename="best_student",
         save_top_k=1,
+        save_last=True,
         mode="min"
     )
     
@@ -306,7 +326,7 @@ def main():
 
     # 9. Run Training
     print("Starting training loop...")
-    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=resume_ckpt_path)
     
     best_path = checkpoint_callback.best_model_path
     print(f"Training completed. Best model checkpoint saved to: {best_path}")
@@ -321,6 +341,13 @@ def main():
             "alpha": float(alpha)
         }
     )
+
+    # Optional / Non-blocking curve plotting helper call
+    try:
+        from scripts.plot_training_curves import plot_curves
+        plot_curves(exp_dir=exp_dir)
+    except Exception as e:
+        print(f"[Plotting Warning] Could not generate loss curve plot: {e}")
 
 if __name__ == "__main__":
     main()
