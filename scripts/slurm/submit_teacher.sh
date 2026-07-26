@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --partition=gpu-v100s
+#SBATCH --partition=gpu-a100
 #SBATCH --job-name=m5_teacher
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
