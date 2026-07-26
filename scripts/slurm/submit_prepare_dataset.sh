@@ -17,5 +17,5 @@ conda activate m5_env 2>/dev/null || true
 
 mkdir -p logs
 echo "Preprocessing dataset on CPU compute node..."
-python scripts/prepare_dataset.py --env dicc --experiment full "$@"
+python scripts/prepare_dataset.py --env dicc "$@"
 echo "Dataset preparation completed successfully."

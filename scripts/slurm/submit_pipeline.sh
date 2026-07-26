@@ -39,7 +39,7 @@ mkdir -p logs
 
 # Step 1: Preprocess dataset
 echo "=== Step 1: Preprocessing Dataset ==="
-python scripts/prepare_dataset.py --env dicc --experiment full
+python scripts/prepare_dataset.py --env dicc
 
 # Step 2: Train TFT Teacher Model
 echo "=== Step 2: Training TFT Teacher Model ==="
