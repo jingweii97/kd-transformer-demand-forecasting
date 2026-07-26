@@ -4,11 +4,17 @@
 
 set -e
 
-if [ -z "$USER" ]; [ -z "$LOGNAME" ]; then
-    USER=$(whoami)
-fi
+USER_NAME=${USER:-$(whoami)}
 
-SCRATCH_BASE="/scr/$USER"
+if [ -d "/scr" ]; then
+    SCRATCH_BASE="/scr/$USER_NAME"
+    mkdir -p "$SCRATCH_BASE" 2>/dev/null || true
+elif [ -d "/scratch" ]; then
+    SCRATCH_BASE="/scratch/$USER_NAME"
+    mkdir -p "$SCRATCH_BASE" 2>/dev/null || true
+else
+    SCRATCH_BASE="/scr/$USER_NAME"
+fi
 
 echo "=================================================="
 echo "HPC Scratch Storage Environment Setup"
@@ -21,7 +27,7 @@ if [ ! -d "$SCRATCH_BASE" ]; then
     exit 0
 fi
 
-# Create subdirectories under /scr/$USER/
+# Create subdirectories under scratch
 mkdir -p "$SCRATCH_BASE/m5_outputs"
 mkdir -p "$SCRATCH_BASE/m5_artifacts"
 
