@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --partition=cpu-epyc
+#SBATCH --partition=cpu-epyc-genoa
 #SBATCH --job-name=m5_prepare_dataset
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
