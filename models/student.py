@@ -52,10 +52,19 @@ class M5TransformerStudent(pl.LightningModule):
         ]
         self.num_known_reals = len(self.known_real_indices)
         
+        self.enc_cont_norm = nn.LayerNorm(self.num_reals)
+        self.dec_cont_norm = nn.LayerNorm(self.num_known_reals)
+        
         # Project concatenated embeddings + continuous variables to d_model
         # Encoder uses all continuous features (reals); Decoder uses only future-known continuous features
-        self.encoder_projector = nn.Linear(self.total_cat_dim + self.num_reals, d_model)
-        self.decoder_projector = nn.Linear(self.total_cat_dim + self.num_known_reals, d_model)
+        self.encoder_projector = nn.Sequential(
+            nn.Linear(self.total_cat_dim + self.num_reals, d_model),
+            nn.LayerNorm(d_model)
+        )
+        self.decoder_projector = nn.Sequential(
+            nn.Linear(self.total_cat_dim + self.num_known_reals, d_model),
+            nn.LayerNorm(d_model)
+        )
         
         # Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -97,7 +106,8 @@ class M5TransformerStudent(pl.LightningModule):
             cat_tensor = torch.clamp(cat_tensor, 0, embed_layer.num_embeddings - 1)
             enc_embedded.append(embed_layer(cat_tensor))
         enc_embedded_tensor = torch.cat(enc_embedded, dim=-1)
-        enc_full = torch.cat([enc_embedded_tensor, x['encoder_cont']], dim=-1)
+        enc_cont_normed = self.enc_cont_norm(x['encoder_cont'])
+        enc_full = torch.cat([enc_embedded_tensor, enc_cont_normed], dim=-1)
         enc_proj = self.encoder_projector(enc_full) # Shape: (batch_size, L, d_model)
         
         # 2. Embed and project future prediction window inputs (decoder)
@@ -110,7 +120,8 @@ class M5TransformerStudent(pl.LightningModule):
         
         # Filter decoder continuous inputs to exclude unknown features (avoid future leakage)
         dec_cont_known = x['decoder_cont'][:, :, self.known_real_indices]
-        dec_full = torch.cat([dec_embedded_tensor, dec_cont_known], dim=-1)
+        dec_cont_normed = self.dec_cont_norm(dec_cont_known)
+        dec_full = torch.cat([dec_embedded_tensor, dec_cont_normed], dim=-1)
         dec_proj = self.decoder_projector(dec_full) # Shape: (batch_size, H, d_model)
         
         # 3. Concatenate lookback and future windows along the time/sequence dimension
