@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #SBATCH --partition=gpu-a100
-#SBATCH --job-name=m5_student
+#SBATCH --job-name=m5_student_nokd
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -21,6 +21,3 @@ conda activate m5_env 2>/dev/null || true
 mkdir -p logs
 echo "Training Student (No KD) for experiment: $EXP_NAME with --experiment full"
 python scripts/train_student.py --env dicc --experiment full --exp-name "$EXP_NAME" --no-kd "$@"
-
-echo "Training Student (With KD) for experiment: $EXP_NAME with --experiment full"
-python scripts/train_student.py --env dicc --experiment full --exp-name "$EXP_NAME" --kd "$@"

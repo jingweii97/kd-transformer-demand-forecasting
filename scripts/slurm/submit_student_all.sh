@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #SBATCH --partition=gpu-a100
-#SBATCH --job-name=m5_student
+#SBATCH --job-name=m5_student_all
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
