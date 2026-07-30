@@ -356,6 +356,8 @@ def main():
     id_end = cfg.dataset.splits.id_test.end
     ood_start = cfg.dataset.splits.ood_test.start
     ood_end = cfg.dataset.splits.ood_test.end
+    test_stream_start = cfg.dataset.splits.test_stream.start
+    test_stream_end = cfg.dataset.splits.test_stream.end
     
     from data.dataset import StorePartitionManager
     partition_manager = StorePartitionManager(training_data, cfg)
@@ -375,10 +377,11 @@ def main():
     results = []
     diagnostics_dict = {}
 
-    # Loop ID and OOD windows
+    # Loop ID Test, OOD Test, and Full Test Stream windows
     for test_name, start_day, end_day in [
         ("ID Test", id_start, id_end),
-        ("OOD Test", ood_start, ood_end)
+        ("OOD Test", ood_start, ood_end),
+        ("Full Test Stream", test_stream_start, test_stream_end)
     ]:
         print(f"\n--- Evaluating Models on {test_name} (Days {start_day} to {end_day}) ---")
         
@@ -604,7 +607,7 @@ def main():
     summary_metrics = {}
     for m in models:
         summary_metrics[m] = {}
-        for w in ["ID Test", "OOD Test"]:
+        for w in ["ID Test", "OOD Test", "Full Test Stream"]:
             df_m_w = df_res[(df_res["Model"] == m) & (df_res["Window"] == w) & (df_res["Horizon"] == "Overall (1-28)")]
             summary_metrics[m][w] = {
                 "WRMSSE": float(df_m_w["WRMSSE"].values[0]),
