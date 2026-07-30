@@ -31,11 +31,11 @@ def main():
     student_kd_chk = os.path.join(outputs_dir, "student", "kd", exp_name, "best_student.ckpt")
     
     base_ds = build_timeseries_dataset(None, cfg, is_train=True)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    teacher = TemporalFusionTransformer.load_from_checkpoint(teacher_chk).to(device).eval()
-    student_nokd = M5TransformerStudent.load_from_checkpoint(student_nokd_chk, training_dataset=base_ds).to(device).eval()
-    student_kd = M5TransformerStudent.load_from_checkpoint(student_kd_chk, training_dataset=base_ds).to(device).eval()
+    teacher = TemporalFusionTransformer.load_from_checkpoint(teacher_chk, map_location="cpu").to(device).eval()
+    student_nokd = M5TransformerStudent.load_from_checkpoint(student_nokd_chk, training_dataset=base_ds, map_location="cpu").to(device).eval()
+    student_kd = M5TransformerStudent.load_from_checkpoint(student_kd_chk, training_dataset=base_ds, map_location="cpu").to(device).eval()
 
     # 2. Get Validation Predictions
     val_max_idx = cfg.dataset.splits.validation.end
