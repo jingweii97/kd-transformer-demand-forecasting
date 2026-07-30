@@ -160,6 +160,10 @@ class M5TransformerStudent(pl.LightningModule):
                     self.soft_targets = self.soft_targets.to(self.device)
                 teacher_preds = self.soft_targets[group_ids, start_times]
             
+            # Fail loudly if any soft target is NaN / missing
+            if not torch.isfinite(teacher_preds).all():
+                raise RuntimeError("Missing or NaN teacher targets encountered in KD training batch. All eligible KD training samples must have complete teacher predictions.")
+
             # Compute losses
             loss_sup = self.loss_fn(preds, y)
             loss_dist = self.loss_fn(preds, teacher_preds)

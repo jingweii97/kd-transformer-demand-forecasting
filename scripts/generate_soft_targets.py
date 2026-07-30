@@ -40,11 +40,9 @@ def main():
     cfg = load_config(env_name=args.env, experiment_name=args.experiment)
     set_seed(cfg.environment.seed)
 
-    # Determine default max day for soft target generation
+    # Determine default max day for soft target generation (training split end)
     train_end = cfg.dataset.splits.train.end
-    prediction_window = cfg.dataset.prediction_window
-    max_prediction_start = train_end - prediction_window + 1
-    max_day = args.max_day if args.max_day is not None else max_prediction_start
+    max_day = args.max_day if args.max_day is not None else train_end
 
     # Define output file path under artifacts/soft_targets/
     artifacts_dir = resolve_path(cfg.environment.artifacts_dir)
@@ -129,8 +127,8 @@ def main():
         unique_groups = sorted(list(set(group_codes_all)))
         group_to_local = {g: idx for idx, g in enumerate(unique_groups)}
         
-        # Allocate store local lookup tensor: (num_store_groups, max_day + 1, forecast_horizon)
-        store_soft_targets = torch.zeros((len(unique_groups), max_day + 1, forecast_horizon), dtype=torch.float32)
+        # Allocate store local lookup tensor: (num_store_groups, max_day + 1, forecast_horizon) initialized to NaN
+        store_soft_targets = torch.full((len(unique_groups), max_day + 1, forecast_horizon), float('nan'), dtype=torch.float32)
         
         # Chunk items to control TimeSeriesDataSet RAM footprint
         unique_items = df_part_sliced['item_id'].unique()
