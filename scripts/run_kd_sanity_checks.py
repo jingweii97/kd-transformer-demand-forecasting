@@ -1,5 +1,8 @@
 import os
 import sys
+# Set CUDA_VISIBLE_DEVICES to empty if no GPU is active to prevent torchmetrics CUDA init crash
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 import torch
 import numpy as np
 import pandas as pd
