@@ -1,32 +1,27 @@
 """
 evaluate_models.py — M5 Model Evaluation Script
 
-Evaluates four models (Seasonal Naive, TFT Teacher, Student w/o KD, Student w/ KD)
-across:
-  - Three predefined fixed windows: ID Reference, Event-Intensive OOD, Extended-Gap OOD
-  - Overall held-out test stream: 52 seven-day-aligned origins (d1554–d1911)
-
-Methodology (P2 draft):
-  - 90-day historical input (lookback), 28-day horizon, 7-day stride
-  - Metrics: WRMSSE (primary), MAE, RMSE, MASE, WAPE
-  - Separate controlled inference benchmark distinct from per-origin operational runtime
+Methodology (P2):
+  - Fixed Windows: ID Reference, Event-Intensive OOD, Extended-Gap OOD
+  - Overall Test Stream: 52 seven-day-aligned origins
+  - Strict checkpointing with SHA-256
+  - Robust WRMSSE (zero-sales stripping)
+  - 90-day benchmark inference latency
 """
 
 import os
 import sys
-import json
-import gc
-import time
 import argparse
-import glob
-import hashlib
-
+import torch
 import numpy as np
 import pandas as pd
-import torch
+import hashlib
+import glob
+import time
+import json
+import gc
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 
-# Add repository root to python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.config import load_config, save_config, save_metadata
@@ -36,1154 +31,848 @@ from data.cache import load_from_cache, load_dataset_from_cache, resolve_stores
 from data.dataset import build_timeseries_dataset
 from models.student import M5TransformerStudent
 
-# ─── Constants ────────────────────────────────────────────────────────────────
-
-# Official 12 M5 aggregation levels
 HIERARCHY_LEVELS = [
-    [],                               # Level  1: All products, all stores
-    ['state_id'],                     # Level  2: All products, by state
-    ['store_id'],                     # Level  3: All products, by store
-    ['cat_id'],                       # Level  4: All products, by category
-    ['dept_id'],                      # Level  5: All products, by department
-    ['state_id', 'cat_id'],           # Level  6: By state and category
-    ['state_id', 'dept_id'],          # Level  7: By state and department
-    ['store_id', 'cat_id'],           # Level  8: By store and category
-    ['store_id', 'dept_id'],          # Level  9: By store and department
-    ['item_id'],                      # Level 10: Individual product, all stores
-    ['item_id', 'state_id'],          # Level 11: Individual product, by state
-    ['id'],                           # Level 12: Individual product, by store
-]
-
-CAT_COLS = [
-    'id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id',
-    'weekday', 'month', 'year', 'event_name_1', 'event_type_1',
-]
-
-HIERARCHY_COLS = ['item_id', 'dept_id', 'cat_id', 'store_id', 'state_id']
-
-HORIZON_SLICES = [
-    ("Overall (1-28)", 0, 28),
-    ("Short (1-7)",    0,  7),
-    ("Medium (8-14)",  7, 14),
-    ("Long (15-28)",  14, 28),
+    [], ['state_id'], ['store_id'], ['cat_id'], ['dept_id'],
+    ['state_id', 'cat_id'], ['state_id', 'dept_id'], ['store_id', 'cat_id'],
+    ['store_id', 'dept_id'], ['item_id'], ['item_id', 'state_id'], ['id']
 ]
 
 FULL_M5_SERIES_COUNT = 30490
 
-METRICS = ["WRMSSE", "MAE", "RMSE", "MASE", "WAPE"]
+def resolve_model_checkpoint(cli_path, config_path, outputs_dir, rel_subpath):
 
-# ─── Scale Helpers ─────────────────────────────────────────────────────────────
+    if cli_path:
+
+        resolved = resolve_path(cli_path)
+
+        if os.path.exists(resolved):
+
+            return resolved
+
+        raise FileNotFoundError(f"CLI-specified checkpoint not found: '{resolved}'")
+
+    if config_path:
+
+        resolved = resolve_path(config_path)
+
+        if os.path.exists(resolved):
+
+            return resolved
+
+        raise FileNotFoundError(f"Config-specified checkpoint not found: '{resolved}'")
+
+
+
+    # Fallback to deterministic expected path in outputs
+
+    fallback = os.path.abspath(os.path.join(outputs_dir, rel_subpath))
+
+    if os.path.exists(fallback):
+
+        return fallback
+
+
+
+    raise FileNotFoundError(
+
+        f"Final evaluation requires explicit checkpoints. '{fallback}' not found "
+
+        "and no valid CLI or config path provided."
+
+    )
 
 def _compute_scale(series: np.ndarray):
+
     """
+
     M5-aligned in-sample naive (first-difference) scale for one hierarchy aggregate.
 
+
+
     The caller must reindex the series to a contiguous time_idx range (gap days
+
     filled with 0) before calling, so that missing calendar days are treated as
+
     zero-sale observations consistent with M5 convention.
 
+
+
     Steps:
+
       1. Strip leading observations before the first non-zero sale.
+
       2. Compute mean squared first difference on remaining observations.
+
       3. Return FALLBACK (1e-4) if fewer than 2 observations remain or result is 0.
 
+
+
     Returns
+
     -------
+
     scale  : float
-    reason : str — one of 'valid', 'insufficient_length', 'all_zero', 'zero_variance'
+
+    reason : str ΓÇö one of 'valid', 'insufficient_length', 'all_zero', 'zero_variance'
+
     """
+
     FALLBACK = 1e-4
+
     if len(series) < 2:
+
         return FALLBACK, "insufficient_length"
+
     first_nonzero_idx = np.argmax(series > 0)
+
     if series[first_nonzero_idx] == 0:
+
         # np.argmax returns 0 when all elements are 0 (no True found)
+
         return FALLBACK, "all_zero"
+
     trimmed = series[first_nonzero_idx:]
+
     if len(trimmed) < 2:
+
         return FALLBACK, "insufficient_length"
+
     sq_diffs = np.diff(trimmed.astype(float)) ** 2
+
     scale = float(np.mean(sq_diffs))
+
     if scale <= 0:
+
         return FALLBACK, "zero_variance"
+
     return scale, "valid"
 
-
 def compute_wrmsse_weights_and_scales(df_train, train_end):
+
     """
+
     Pre-computes M5 hierarchy scales (naive std) and dollar-value weights.
 
+
+
     Applies M5-aligned corrections:
+
       - Reindexes each aggregate series to a full contiguous time_idx range
+
         (zero-fills calendar gaps) before computing the scale.
+
       - Strips leading zero observations per series (before first non-zero sale).
 
+
+
     Returns
+
     -------
-    weights_dict     : dict  Level_k → {group_key: weight}
-    scales_dict      : dict  Level_k → {group_key: scale}
+
+    weights_dict     : dict  Level_k ΓåÆ {group_key: weight}
+
+    scales_dict      : dict  Level_k ΓåÆ {group_key: scale}
+
     scale_diagnostics: dict  audit counts and affected WRMSSE weight
+
     """
+
     print("Pre-computing WRMSSE scale factors and value weights...")
+
     df_train = df_train.copy()
+
     df_train['dollar_value'] = df_train['sales'] * df_train['sell_price']
 
+
+
     # Value weights: last 28 days of training
+
     df_weight_window = df_train[df_train['time_idx'] > (train_end - 28)].copy()
+
     total_dollar_sum = df_weight_window['dollar_value'].sum()
 
+
+
     weights_dict = {}
+
     scales_dict  = {}
 
+
+
     scale_diagnostics = {
+
         "valid": 0,
+
         "insufficient_length": 0,
+
         "all_zero": 0,
+
         "zero_variance": 0,
+
         "total_wrmsse_weight_on_fallback": 0.0,
+
         "fallback_series": [],
+
     }
 
+
+
     # Full contiguous time_idx range for reindexing (calendar gap fill)
+
     full_time_range = np.arange(int(df_train['time_idx'].min()), train_end + 1)
 
+
+
     for level_idx, group_cols in enumerate(HIERARCHY_LEVELS, 1):
+
         level_name = f"Level_{level_idx}"
+
         weights_dict[level_name] = {}
+
         scales_dict[level_name]  = {}
-        scale_reasons = {}  # key_str → reason string
+
+        scale_reasons = {}  # key_str ΓåÆ reason string
+
+
 
         if len(group_cols) == 0:
+
             # Level 1: aggregate all series
+
             agg = (df_train.groupby('time_idx')['sales']
+
                            .sum()
+
                            .reindex(full_time_range, fill_value=0)
+
                            .values)
+
             scale, reason = _compute_scale(agg)
+
             scales_dict[level_name]['Total']  = scale
+
             weights_dict[level_name]['Total'] = 1.0
+
             scale_reasons['Total'] = reason
+
             scale_diagnostics[reason] += 1
+
             if reason != "valid":
+
                 scale_diagnostics["total_wrmsse_weight_on_fallback"] += 1.0
+
                 scale_diagnostics["fallback_series"].append(f"{level_name}/Total")
+
         else:
+
             # Grouped levels
+
             df_grouped_train  = (df_train.groupby(group_cols + ['time_idx'])['sales']
+
                                          .sum().reset_index())
+
             df_grouped_weight = (df_weight_window.groupby(group_cols)['dollar_value']
+
                                                  .sum().reset_index())
 
+
+
             # Compute scales
+
             for keys, group in df_grouped_train.groupby(group_cols):
+
                 if isinstance(keys, tuple):
+
                     key_str = "_".join(str(k) for k in keys)
+
                 else:
+
                     key_str = str(keys)
+
                 agg = (group.set_index('time_idx')['sales']
+
                             .reindex(full_time_range, fill_value=0)
+
                             .values)
+
                 scale, reason = _compute_scale(agg)
+
                 scales_dict[level_name][key_str] = scale
+
                 scale_reasons[key_str] = reason
+
                 scale_diagnostics[reason] += 1
 
+
+
             # Compute weights; audit fallback impact
+
             for _, row in df_grouped_weight.iterrows():
+
                 keys_vals = row[group_cols].values
+
                 if len(group_cols) > 1:
+
                     key_str = "_".join(str(k) for k in keys_vals)
+
                 else:
+
                     key_str = str(keys_vals[0])
+
                 w = float(row['dollar_value'] / total_dollar_sum) if total_dollar_sum > 0 else 0.0
+
                 weights_dict[level_name][key_str] = w
+
                 if scale_reasons.get(key_str, "valid") != "valid":
+
                     scale_diagnostics["total_wrmsse_weight_on_fallback"] += w
+
                     scale_diagnostics["fallback_series"].append(f"{level_name}/{key_str}")
 
+
+
         # Validate weights sum to 1.0 (with a small tolerance)
+
         level_weight_sum = sum(weights_dict[level_name].values())
+
         assert np.isclose(level_weight_sum, 1.0, atol=1e-6), \
             f"{level_name} weights sum to {level_weight_sum}"
 
+
+
     n_fallback = (scale_diagnostics["insufficient_length"]
+
                   + scale_diagnostics["all_zero"]
+
                   + scale_diagnostics["zero_variance"])
+
     print(f"  Scale diagnostics: valid={scale_diagnostics['valid']}, "
+
           f"fallback={n_fallback}, "
+
           f"total_weight_on_fallback={scale_diagnostics['total_wrmsse_weight_on_fallback']:.4f}")
+
     if scale_diagnostics["total_wrmsse_weight_on_fallback"] > 0.05:
-        print("  WARNING: >5% of WRMSSE weight is on fallback scales — "
+
+        print("  WARNING: >5% of WRMSSE weight is on fallback scales ΓÇö "
+
               "inspect wrmsse_scale_diagnostics.json before reporting results.")
+
+
 
     return weights_dict, scales_dict, scale_diagnostics
 
-
-def compute_mase_scales(df_train):
-    """
-    Pre-computes per-series MASE denominator using a 28-day seasonal lag.
-
-    MASE denominator = mean |y_t - y_{t-28}| over the training period,
-    computed only on observations at or after the first non-zero sale per series.
-
-    The 28-day seasonal lag matches the Seasonal Naive baseline used as the
-    denominator and is distinct from the first-difference RMSSE scale.
-
-    Returns dict {id_str: scale_float}
-    """
-    print("Pre-computing per-series MASE scales (28-day seasonal lag, "
-          "leading-zero stripping)...")
-    df_sorted = (df_train
-                 .sort_values(by=['id', 'time_idx'])
-                 .reset_index(drop=True))
-
-    # 28-day lag shift per series (boundary-safe via groupby shift)
-    prev_sales = df_sorted.groupby('id', observed=True)['sales'].shift(28)
-
-    # Mark observations within the active sale period (at or after first non-zero sale)
-    df_sorted['cummax_sales'] = (df_sorted.groupby('id', observed=True)['sales']
-                                          .cummax())
-    df_sorted['in_sale_period'] = df_sorted['cummax_sales'] > 0
-
-    df_sorted['abs_diff'] = np.abs(df_sorted['sales'] - prev_sales)
-    # Only count observations in sale period where lag is available
-    df_sorted['valid_diff'] = df_sorted['abs_diff'].where(
-        df_sorted['in_sale_period'] & prev_sales.notna()
-    )
-
-    scales_raw = df_sorted.groupby('id', observed=True)['valid_diff'].mean()
-    n_missing = scales_raw.isna().sum()
-    n_zero    = (scales_raw == 0).sum()
-    total     = len(scales_raw)
-    
-    print(f"  MASE diagnostics: {n_missing} missing scales, {n_zero} zero scales. "
-          f"({(n_missing + n_zero) / total * 100:.2f}% of series use fallback 1.0)")
-
-    scales = scales_raw.fillna(1.0).replace(0.0, 1.0)
-    return scales.to_dict()
-
-
-# ─── Metric Functions ──────────────────────────────────────────────────────────
-
 def compute_hierarchical_wrmsse(df_test_gt, df_test_preds, weights_dict, scales_dict):
+
     """
-    Computes M5 WRMSSE across all 12 hierarchy levels.
-    Expects df_test_gt and df_test_preds to have columns:
-      time_idx, sales, and all hierarchy identifiers.
+
+    Computes M5 WRMSSE across all hierarchy levels.
+
     """
+
     level_wrmsses = []
 
-    for level_idx, group_cols in enumerate(HIERARCHY_LEVELS, 1):
-        level_name = f"Level_{level_idx}"
-        level_weights = weights_dict[level_name]
-        level_scales  = scales_dict[level_name]
+    
 
-        rmsses  = []
+    for level_idx, group_cols in enumerate(HIERARCHY_LEVELS, 1):
+
+        level_name = f"Level_{level_idx}"
+
+        level_weights = weights_dict[level_name]
+
+        level_scales = scales_dict[level_name]
+
+        
+
+        rmsses = []
+
         weights = []
 
+        
+
         if len(group_cols) == 0:
-            gt_agg   = df_test_gt.groupby('time_idx')['sales'].sum().sort_index().values
+
+            # Level 1
+
+            gt_agg = df_test_gt.groupby('time_idx')['sales'].sum().sort_index().values
+
             pred_agg = df_test_preds.groupby('time_idx')['sales'].sum().sort_index().values
+
+            
+
             mse = np.mean((gt_agg - pred_agg) ** 2)
-            rmsses.append(np.sqrt(mse / level_scales['Total']))
+
+            scale = level_scales['Total']
+
+            rmsses.append(np.sqrt(mse / scale))
+
             weights.append(1.0)
+
         else:
-            df_gt_grouped   = (df_test_gt.groupby(group_cols + ['time_idx'])['sales']
-                                         .sum().reset_index())
-            df_pred_grouped = (df_test_preds.groupby(group_cols + ['time_idx'])['sales']
-                                            .sum().reset_index())
-            df_merged = df_gt_grouped.merge(
-                df_pred_grouped, on=group_cols + ['time_idx'], suffixes=('_gt', '_pred')
-            )
+
+            # Group actuals and predictions
+
+            df_gt_grouped = df_test_gt.groupby(group_cols + ['time_idx'])['sales'].sum().reset_index()
+
+            df_pred_grouped = df_test_preds.groupby(group_cols + ['time_idx'])['sales'].sum().reset_index()
+
+            
+
+            # Merge to align keys
+
+            df_merged = df_gt_grouped.merge(df_pred_grouped, on=group_cols + ['time_idx'], suffixes=('_gt', '_pred'))
+
+            
+
             for keys, group in df_merged.groupby(group_cols):
-                if isinstance(keys, tuple):
-                    key_str = "_".join(str(k) for k in keys)
-                else:
-                    key_str = str(keys)
-                gt_vals   = group.sort_values('time_idx')['sales_gt'].values
-                pred_vals = group.sort_values('time_idx')['sales_pred'].values
-                mse   = np.mean((gt_vals - pred_vals) ** 2)
+
+                key_str = "_".join(keys) if isinstance(keys, tuple) else str(keys)
+
                 
-                assert key_str in level_scales, f"Missing scale for {level_name}/{key_str}"
-                assert key_str in level_weights, f"Missing weight for {level_name}/{key_str}"
+
+                gt_vals = group.sort_values(by='time_idx')['sales_gt'].values
+
+                pred_vals = group.sort_values(by='time_idx')['sales_pred'].values
+
                 
+
+                mse = np.mean((gt_vals - pred_vals) ** 2)
+
+                assert key_str in level_scales, f"Missing WRMSSE scale for {level_name}/{key_str}"
+                assert key_str in level_weights, f"Missing WRMSSE weight for {level_name}/{key_str}"
                 scale = level_scales[key_str]
-                w     = level_weights[key_str]
+                w = level_weights[key_str]
+
+                
+
                 rmsses.append(np.sqrt(mse / scale))
+
                 weights.append(w)
 
-        level_wrmsse = float(np.sum(np.array(rmsses) * np.array(weights)))
+                
+
+        level_wrmsse = np.sum(np.array(rmsses) * np.array(weights))
+
         level_wrmsses.append(level_wrmsse)
 
-    overall_wrmsse = float(np.mean(level_wrmsses))
+        
+
+    overall_wrmsse = np.mean(level_wrmsses)
+
     return overall_wrmsse, level_wrmsses
 
+def compute_point_metrics(actuals, forecasts):
 
-def compute_point_metrics(actuals_flat, forecasts_flat):
-    """Returns (MAE, RMSE, WAPE) for flat arrays."""
-    mae  = float(np.mean(np.abs(actuals_flat - forecasts_flat)))
-    rmse = float(np.sqrt(np.mean((actuals_flat - forecasts_flat) ** 2)))
-    total_sales = float(np.sum(actuals_flat))
-    wape = float(np.sum(np.abs(actuals_flat - forecasts_flat)) / total_sales) \
-           if total_sales > 0 else 0.0
+    """
+
+    Computes standard point forecast accuracy metrics.
+
+    """
+
+    mae = np.mean(np.abs(actuals - forecasts))
+
+    rmse = np.sqrt(np.mean((actuals - forecasts) ** 2))
+
+    
+
+    total_abs_error = np.sum(np.abs(actuals - forecasts))
+
+    total_sales = np.sum(actuals)
+
+    wape = total_abs_error / total_sales if total_sales > 0 else 0.0
+
+    
+
     return mae, rmse, wape
 
+def compute_mase_scales(df_train, train_end):
+
+    """
+
+    Precomputes the seasonal naive MAE denominator (in-sample absolute difference scale)
+
+    for each series.
+
+    """
+
+    print("Pre-computing scale factors for the MASE calculation...")
+
+    # Group by id and time_idx to get sales per series per day, ensuring correct order
+
+    df_sorted = df_train.sort_values(by=['id', 'time_idx']).reset_index(drop=True)
+
+    
+
+    # Calculate absolute differences lagged by 28 days per series
+
+    # Using pandas groupby shift to avoid boundary leakage between different ids
+
+    sales = df_sorted['sales'].values
+
+    prev_sales = df_sorted.groupby('id')['sales'].shift(28).values
+
+    
+
+    df_sorted['abs_diff'] = np.abs(sales - prev_sales)
+
+    
+
+    # Mean absolute difference for each series (ignoring NaNs from first 28 days)
+
+    scales = df_sorted.groupby('id', observed=True)['abs_diff'].mean()
+
+    
+
+    # Fill zero or NaN scales to avoid division by zero
+
+    scales = scales.fillna(1.0).replace(0.0, 1.0)
+
+    return scales.to_dict()
 
 def compute_mase(actuals_slice, forecasts_slice, scales_array):
+
     """
-    Computes mean MASE over all series in a slice.
-    actuals_slice   : (num_series, slice_len)
-    forecasts_slice : (num_series, slice_len)
-    scales_array    : (num_series,) — 28-day seasonal lag denominator per series
+
+    Computes MASE for each series and returns the average MASE.
+
+    actuals_slice shape: (num_series, slice_len)
+
+    forecasts_slice shape: (num_series, slice_len)
+
+    scales_array shape: (num_series,)
+
     """
-    mae_per_series  = np.mean(np.abs(actuals_slice - forecasts_slice), axis=1)
+
+    mae_per_series = np.mean(np.abs(actuals_slice - forecasts_slice), axis=1)
+
     mase_per_series = mae_per_series / scales_array
-    return float(np.mean(mase_per_series))
+
+    return np.mean(mase_per_series)
 
 
-# ─── Alignment Helpers ─────────────────────────────────────────────────────────
 
-def _build_long_form_table(ids, actuals, naive_forecasts, model_preds_dict, origin, H):
+def get_predictions(model, loader):
+
     """
-    Build a vectorized long-form prediction table for one evaluation window.
 
-    Parameters
-    ----------
-    ids              : array of series ID strings, shape (N,)
-    actuals          : array shape (N, H)
-    naive_forecasts  : array shape (N, H)
-    model_preds_dict : {model_name: array(N, H)} for neural models
-    origin           : first target day index (int)
-    H                : prediction horizon length (int)
+    Generates point forecasts from PyTorch Forecasting (TFT) or custom Lightning Student Module.
 
-    Returns
-    -------
-    pd.DataFrame with columns:
-        id, origin, h, time_idx_target, actual, naive, pred_<model_name>...
     """
-    n = len(ids)
-    id_arr          = np.repeat(ids, H)               # N*H
-    h_arr           = np.tile(np.arange(H), n)        # N*H
-    time_idx_arr    = origin + h_arr
 
-    df = pd.DataFrame({
-        'id':             id_arr,
-        'origin':         origin,
-        'h':              h_arr,
-        'time_idx_target': time_idx_arr,
-        'actual':         actuals.flatten(),           # row-major → series i owns h_arr[i*H:(i+1)*H]
-        'naive':          naive_forecasts.flatten(),
-    })
-    for model_name, preds in model_preds_dict.items():
-        df[f'pred_{model_name}'] = preds.flatten()
+    # For TFT Teacher, use PyTorch Forecasting's built-in predict method
 
-    return df
+    if isinstance(model, TemporalFusionTransformer):
 
+        preds = model.predict(
 
-def _assert_alignment(df_long, expected_rows, model_names, id_meta):
-    """
-    Assert structural integrity of the long-form prediction table before metric
-    computation. Raises AssertionError on any violation.
-    """
-    assert len(df_long) == expected_rows, \
-        f"Row count mismatch: {len(df_long)} != {expected_rows}"
-    assert not df_long[['id', 'time_idx_target']].duplicated().any(), \
-        "Duplicate (id, time_idx_target) pairs found"
-    assert df_long['actual'].notna().all(), \
-        "Missing actuals in long-form table"
-    assert df_long['naive'].notna().all(), \
-        "Missing naive predictions in long-form table"
-    for model_name in model_names:
-        col = f'pred_{model_name}'
-        if col in df_long.columns:
-            assert df_long[col].notna().all(), \
-                f"Missing predictions for model: {model_name}"
-    # Hierarchy metadata
-    for hcol in HIERARCHY_COLS:
-        if hcol in df_long.columns:
-            assert df_long[hcol].notna().all(), \
-                f"Missing hierarchy column after join: {hcol}"
-    assert df_long['id'].isin(id_meta.index).all(), \
-        "Some series IDs have no hierarchy metadata — join may be incomplete"
+            loader,
 
+            mode="prediction",
 
-def _build_wrmsse_df(df_long_slice, value_col, id_meta):
-    """
-    Build a DataFrame suitable for compute_hierarchical_wrmsse from a slice
-    of the long-form table.
+            trainer_kwargs={
 
-    Returns df with columns: id, time_idx, sales, item_id, dept_id, cat_id,
-    store_id, state_id.
-    """
-    df = df_long_slice[['id', 'time_idx_target', value_col]].copy()
-    df = df.rename(columns={'time_idx_target': 'time_idx', value_col: 'sales'})
-    available_hcols = [c for c in HIERARCHY_COLS if c in id_meta.columns]
-    df = df.join(id_meta[available_hcols], on='id', how='left')
-    return df
+                "accelerator": "cuda" if torch.cuda.is_available() else "cpu",
 
+                "devices": 1
 
+            }
 
-# ─── Inference Functions ───────────────────────────────────────────────────────
+        )
 
-def run_inference_tft(model, loader, device):
-    """
-    Run TFT inference using model.predict() (operational runtime).
-    TFT timing includes Lightning Trainer setup and prediction orchestration.
-    This is labelled as operational runtime, not pure model latency.
+        return preds.cpu().numpy()
 
-    Returns (preds_np: ndarray (N, H), elapsed_sec: float)
-    """
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    preds = model.predict(
-        loader,
-        mode="prediction",
-        trainer_kwargs={
-            "accelerator": "cuda" if torch.cuda.is_available() else "cpu",
-            "devices": 1,
-        },
-    )
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    elapsed = time.perf_counter() - t0
-    return preds.cpu().numpy(), elapsed
+        
 
+    # For custom Student models, run standard batch evaluation
 
-def run_inference_student(model, loader, device):
-    """
-    Run student model inference with a manual batch loop (operational runtime).
-
-    Returns (preds_np: ndarray (N, H), elapsed_sec: float)
-    """
     model.eval()
-    model.to(device)
+
     all_preds = []
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    with torch.inference_mode():
+
+    with torch.no_grad():
+
         for batch in loader:
+
             x, _ = batch
-            for k in list(x.keys()):
-                if isinstance(x[k], torch.Tensor):
-                    x[k] = x[k].to(device)
+
+            if hasattr(model, "device"):
+
+                for k in x.keys():
+
+                    if isinstance(x[k], torch.Tensor):
+
+                        x[k] = x[k].to(model.device)
+
             preds = model(x)
+
             all_preds.append(preds.cpu())
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    elapsed = time.perf_counter() - t0
-    return torch.cat(all_preds, dim=0).numpy(), elapsed
 
-
-# ─── Benchmark Forward Adapters ────────────────────────────────────────────────
+    return torch.cat(all_preds, dim=0).numpy()
 
 def forward_tft(model, x):
-    """
-    TFT forward adapter for controlled benchmark.
-    Calls model(x) to get a structured output dict, then model.to_prediction()
-    to extract the point forecast tensor (shape: batch_size × H).
-    """
     output = model(x)
     return model.to_prediction(output)
 
-
 def forward_student(model, x):
-    """Student forward adapter for controlled benchmark (returns shape: batch_size × H)."""
     return model(x)
 
+def benchmark_inference(models_info, sample_batch, device,
 
-# ─── Checkpoint Helpers ────────────────────────────────────────────────────────
+                        num_warmup=3, num_runs=10):
 
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as file:
-        for block in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-def resolve_model_checkpoint(cli_path, config_path, outputs_dir, rel_subpath):
-    if cli_path:
-        resolved = resolve_path(cli_path)
-        if os.path.exists(resolved):
-            return resolved
-        raise FileNotFoundError(f"CLI-specified checkpoint not found: '{resolved}'")
-    if config_path:
-        resolved = resolve_path(config_path)
-        if os.path.exists(resolved):
-            return resolved
-        raise FileNotFoundError(f"Config-specified checkpoint not found: '{resolved}'")
-
-    # Fallback to deterministic expected path in outputs
-    fallback = os.path.abspath(os.path.join(outputs_dir, rel_subpath))
-    if os.path.exists(fallback):
-        return fallback
-
-    raise FileNotFoundError(
-        f"Final evaluation requires explicit checkpoints. '{fallback}' not found "
-        "and no valid CLI or config path provided."
-    )
-
-
-# ─── Shared Per-Store Inference Utility ───────────────────────────────────────
-
-def _run_store_inference(store, ds_dir, training_data, cfg, args, device,
-                         models_info, origin, slice_start, slice_end, H):
     """
-    Load one store partition, build a TimeSeriesDataSet for the given origin
-    window, extract actuals and naive forecasts from the DataLoader, and run
-    inference for every neural model.
+
+    Controlled inference benchmark with identical timing boundaries for all models.
+
+
+
+    Uses forward adapters (forward_tft / forward_student) so that TFT is measured
+
+    through a simple forward pass (no Lightning Trainer), enabling fair latency
+
+    comparison across models.
+
+
 
     Parameters
+
     ----------
-    models_info : list of (model_name, model_obj, is_tft)
+
+    models_info  : list of (model_name, model_obj, is_tft)
+
+    sample_batch : dict (batch_x) ΓÇö fixed batch used for all timed runs
+
+    device       : torch.device
+
+
 
     Returns
+
     -------
-    dict with keys:
-        decoded        : pd.DataFrame  (decoded_index)
-        actuals        : ndarray (n_store_series, H)
-        naive          : ndarray (n_store_series, H)
-        preds          : {model_name: ndarray (n_store_series, H)}
-        model_times    : {model_name: float}
-        naive_time     : float
-    Or None if the store partition is empty.
+
+    list of benchmark result dicts
+
     """
-    df_part = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
-    if df_part is None:
-        raise FileNotFoundError(f"Cache not found for store: {store}")
 
-    df_sliced = df_part[
-        (df_part['time_idx'] >= slice_start) &
-        (df_part['time_idx'] <= slice_end)
-    ].copy()
-    del df_part
+    results    = []
 
-    for col in CAT_COLS:
-        if col in df_sliced.columns:
-            df_sliced[col] = df_sliced[col].astype(str).astype('category')
+    batch_size = next(
 
-    if len(df_sliced) == 0:
-        return None
+        (v.shape[0] for v in sample_batch.values() if isinstance(v, torch.Tensor)),
 
-    part_ds = TimeSeriesDataSet.from_dataset(
-        training_data, df_sliced, predict=True, stop_randomization=True
-    )
-    decoded = part_ds.decoded_index
+        0
 
-    # ── Assertions: exactly one origin, no duplicate IDs ──────────────────
-    n_unique_origins = decoded["time_idx_first_prediction"].nunique()
-    actual_origin    = int(decoded["time_idx_first_prediction"].iloc[0])
-    assert n_unique_origins == 1, \
-        (f"store={store}, origin={origin}: expected 1 unique origin, "
-         f"got {n_unique_origins}")
-    assert actual_origin == origin, \
-        (f"store={store}: origin mismatch — "
-         f"expected {origin}, got {actual_origin}")
-    assert decoded["id"].is_unique, \
-        f"store={store}, origin={origin}: duplicate series IDs in decoded_index"
-
-    part_loader = part_ds.to_dataloader(
-        train=False,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=cfg.environment.num_workers,
     )
 
-    # ── Actuals + naive (one pass) ─────────────────────────────────────────
-    store_actuals = []
-    store_naive   = []
-    t0 = time.perf_counter()
-    for batch_x, batch_y in part_loader:
-        target = batch_y[0] if isinstance(batch_y, (tuple, list)) else batch_y
-        store_actuals.append(target.cpu().numpy())
-        store_naive.append(batch_x['encoder_target'][:, -28:].cpu().numpy())
-    naive_time = time.perf_counter() - t0
 
-    part_act   = np.concatenate(store_actuals, axis=0)
-    part_naive = np.concatenate(store_naive,   axis=0)
 
-    # ── Independent Alignment Audit (One-time) ─────────────────────────────
-    if not hasattr(_run_store_inference, "audited"):
-        print(f"  [Audit] Independent ID-to-target alignment for store={store}, origin={origin}...")
+    # Move batch tensors to target device once
+
+    batch_dev = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+
+                 for k, v in sample_batch.items()}
+
+
+
+    for model_name, model_obj, is_tft in models_info:
+
+        # ΓöÇΓöÇ Seasonal Naive: array baseline, no neural forward pass ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+        if model_name == "Seasonal Naive":
+
+            naive_input = batch_dev.get('encoder_target', None)
+
+            if naive_input is None:
+
+                results.append({
+
+                    "model": model_name,
+
+                    "notes": "encoder_target not found in sample batch",
+
+                })
+
+                continue
+
+            # Warm-up
+
+            for _ in range(num_warmup):
+
+                _ = naive_input[:, -28:].clone()
+
+            times = []
+
+            for _ in range(num_runs):
+
+                t0 = time.perf_counter()
+
+                _ = naive_input[:, -28:].clone()
+
+                times.append(time.perf_counter() - t0)
+
+            results.append({
+
+                "model":       model_name,
+
+                "device":      str(device),
+
+                "batch_size":  batch_size,
+
+                "num_warmup":  num_warmup,
+
+                "num_runs":    num_runs,
+
+                "mean_ms":     float(np.mean(times) * 1000),
+
+                "sd_ms":       float(np.std(times)  * 1000),
+
+                "notes":       "array-based baseline (cloned), no model forward pass",
+
+            })
+
+            continue
+
+
+
+        # ΓöÇΓöÇ Neural models ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+        forward_fn = forward_tft if is_tft else forward_student
+
+
+
+        model_obj.eval()
+
+        model_obj.to(device)
+
+
+
+        # Warm-up (not timed)
+
+        for _ in range(num_warmup):
+
+            with torch.inference_mode():
+
+                out = forward_fn(model_obj, batch_dev)
+
+                _ = out.sum()
+
+        if torch.cuda.is_available():
+
+            torch.cuda.synchronize()
+
+
+
+        # Timed runs
+
+        times = []
+
+        for _ in range(num_runs):
+
+            if torch.cuda.is_available():
+
+                torch.cuda.synchronize()
+
+            t0 = time.perf_counter()
+
+            with torch.inference_mode():
+
+                out = forward_fn(model_obj, batch_dev)
+
+                _ = out.sum()
+
+            if torch.cuda.is_available():
+
+                torch.cuda.synchronize()
+
+            times.append(time.perf_counter() - t0)
+
+
+
+        results.append({
+
+            "model":       model_name,
+
+            "device":      str(device),
+
+            "batch_size":  batch_size,
+
+            "num_warmup":  num_warmup,
+
+            "num_runs":    num_runs,
+
+            "mean_ms":     float(np.mean(times) * 1000),
+
+            "sd_ms":       float(np.std(times)  * 1000),
+
+            "notes":       "forward only, no trainer or data loading",
+
+        })
+
+        print(f"  Benchmark {model_name:26s}: "
+
+              f"{float(np.mean(times)*1000):.3f} ┬▒ {float(np.std(times)*1000):.3f} ms")
+
+
+
+    return results
+
+
+
+
+
+# ΓöÇΓöÇΓöÇ Main ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+def _run_alignment_audit(df_part, decoded, origin, H, actuals):
+    # Independent alignment audit (executed exactly once)
+    if not hasattr(_run_alignment_audit, "audited"):
         audit_positions = [0, len(decoded) // 2, len(decoded) - 1]
         for pos in audit_positions:
             sid = str(decoded.iloc[pos]["id"])
             raw_target = (
-                df_sliced[
-                    (df_sliced["id"].astype(str) == sid) &
-                    (df_sliced["time_idx"].between(origin, origin + H - 1))
+                df_part[
+                    (df_part["id"].astype(str) == sid) &
+                    (df_part["time_idx"].between(origin, origin + H - 1))
                 ]
                 .sort_values("time_idx")["sales"]
-                .to_numpy()
+                .values
             )
-            assert len(raw_target) == H, f"Independent alignment: expected {H} raw target values for {sid}, got {len(raw_target)}"
-            np.testing.assert_allclose(
-                part_act[pos],
-                raw_target,
-                err_msg=f"Independent alignment failed for {sid}"
-            )
-        print("  [Audit] Passed: Row order target values match source DataFrame exactly.")
-        _run_store_inference.audited = True
-
-    del df_sliced  # Clean up memory after audit
-
-    assert part_act.shape[1] == H, \
-        f"store={store}, origin={origin}: actuals shape mismatch {part_act.shape}"
-    assert len(decoded) == part_act.shape[0], \
-        (f"store={store}, origin={origin}: decoded rows ({len(decoded)}) "
-         f"!= actuals rows ({part_act.shape[0]})")
-
-    # ── Neural model inference (separate timed pass per model) ────────────
-    preds       = {}
-    model_times = {}
-    for model_name, model_obj, is_tft in models_info:
-        if is_tft:
-            p, elapsed = run_inference_tft(model_obj, part_loader, device)
-        else:
-            p, elapsed = run_inference_student(model_obj, part_loader, device)
-        
-        assert p.shape == part_act.shape, (
-            f"Prediction shape mismatch for {model_name}: "
-            f"pred={p.shape}, actual={part_act.shape}, "
-            f"store={store}, origin={origin}"
-        )
-        assert np.isfinite(p).all(), (
-            f"Non-finite predictions detected for {model_name}, "
-            f"store={store}, origin={origin}"
-        )
-        preds[model_name]       = p
-        model_times[model_name] = elapsed
-
-    assert part_naive.shape == part_act.shape
-    assert np.isfinite(part_naive).all()
-    assert np.isfinite(part_act).all()
-
-    del part_loader, part_ds
-    gc.collect()
-
-    return {
-        "decoded":     decoded,
-        "actuals":     part_act,
-        "naive":       part_naive,
-        "preds":       preds,
-        "model_times": model_times,
-        "naive_time":  naive_time,
-    }
-
-
-# ─── Fixed-Window Evaluator ────────────────────────────────────────────────────
-
-def evaluate_fixed_window(scenarios, df, cfg, models_info, training_data,
-                          weights_dict, scales_dict, mase_scales_dict, id_meta,
-                          ds_dir, args, device):
-    """
-    Evaluate all models on three predefined fixed-window scenarios.
-
-    Parameters
-    ----------
-    scenarios  : list of (name, start_day, end_day)
-    models_info: list of (model_name, model_obj, is_tft)
-
-    Returns
-    -------
-    list of result dicts (one per model × scenario × horizon slice)
-    """
-    H = cfg.dataset.prediction_window
-    L = cfg.dataset.lookback_window
-
-    stores    = resolve_stores(cfg.environment.store_filter)
-    max_stores = getattr(cfg.environment, "max_stores", None)
-    if max_stores is not None:
-        stores = stores[:max_stores]
-
-    results = []
-
-    for test_name, start_day, end_day in scenarios:
-        print(f"\n--- Fixed Window: {test_name} "
-              f"(d{start_day}–d{end_day}) ---")
-
-        # Data slice: exactly one lookback + one prediction window ending at end_day
-        # start_day is the first target day; the lookback begins at start_day - L
-        slice_start = start_day - L        # first history day
-        slice_end   = end_day              # last target day  (= start_day + H - 1)
-
-        model_names   = [name for name, _, _ in models_info]
-        cumul_preds   = {name: [] for name in model_names}
-        all_actuals   = []
-        all_naive     = []
-        all_decoded   = []
-        model_times   = {name: 0.0 for name in model_names}
-        naive_time    = 0.0
-
-        for store in stores:
-            result = _run_store_inference(
-                store, ds_dir, training_data, cfg, args, device,
-                models_info, start_day, slice_start, slice_end, H
-            )
-            if result is None:
-                continue
-            all_actuals.append(result["actuals"])
-            all_naive.append(result["naive"])
-            all_decoded.append(result["decoded"].copy())
-            naive_time += result["naive_time"]
-            for name, p in result["preds"].items():
-                cumul_preds[name].append(p)
-                model_times[name] += result["model_times"][name]
-
-        # ── Aggregate across stores ────────────────────────────────────────
-        actuals         = np.concatenate(all_actuals, axis=0)
-        naive_forecasts = np.concatenate(all_naive,   axis=0)
-        concat_decoded  = pd.concat(all_decoded, ignore_index=True)
-        n_series        = actuals.shape[0]
-
-        assert n_series == FULL_M5_SERIES_COUNT, \
-            f"Dataset rule violation: {test_name} has {n_series} series " \
-            f"(expected {FULL_M5_SERIES_COUNT}). Final eval must use full population."
-
-        neural_preds = {name: np.concatenate(v, axis=0)
-                        for name, v in cumul_preds.items() if v}
-        ids = concat_decoded['id'].astype(str).values
-
-        # ── Long-form table ────────────────────────────────────────────────
-        df_long = _build_long_form_table(
-            ids, actuals, naive_forecasts, neural_preds, start_day, H
-        )
-        df_long = df_long.join(id_meta, on='id', how='left')
-
-        _assert_alignment(df_long, n_series * H, list(neural_preds.keys()), id_meta)
-
-        # ── Compute metrics per model per horizon slice ────────────────────
-        model_forecast_map = {"Seasonal Naive": "naive",
-                              **{name: f"pred_{name}" for name in neural_preds}}
-
-        for model_name, pred_col in model_forecast_map.items():
-            inf_time         = naive_time if model_name == "Seasonal Naive" else model_times[model_name]
-            n_forecasts      = n_series
-            norm_inf_time    = (inf_time / n_forecasts * 1000.0) if n_forecasts > 0 else 0.0
-
-            ids_sorted   = sorted(df_long['id'].unique())
-            missing_mase_ids = [sid for sid in ids_sorted if sid not in mase_scales_dict]
-            assert not missing_mase_ids, f"Missing MASE scales for {len(missing_mase_ids)} series"
-            scales_array = np.array([mase_scales_dict[sid] for sid in ids_sorted])
-
-            for slice_name, s_h, e_h in HORIZON_SLICES:
-                df_slice = df_long[df_long['h'].between(s_h, e_h - 1)].copy()
-
-                act_pivot  = df_slice.pivot(index='id', columns='h', values='actual').sort_index()
-                pred_pivot = df_slice.pivot(index='id', columns='h', values=pred_col).sort_index()
-                actuals_slice   = act_pivot.values
-                forecasts_slice = pred_pivot.values
-
-                mae, rmse, wape = compute_point_metrics(
-                    actuals_slice.flatten(), forecasts_slice.flatten()
-                )
-                mase = compute_mase(actuals_slice, forecasts_slice, scales_array)
-
-                df_gt_w   = _build_wrmsse_df(df_slice, 'actual',   id_meta)
-                df_pred_w = _build_wrmsse_df(df_slice, pred_col,   id_meta)
-                wrmsse, level_wrmsses = compute_hierarchical_wrmsse(
-                    df_gt_w, df_pred_w, weights_dict, scales_dict
-                )
-
-                print(f"  {model_name:26s} | {slice_name:15s} -> "
-                      f"WRMSSE: {wrmsse:.4f} | MAE: {mae:.4f} | "
-                      f"RMSE: {rmse:.4f} | MASE: {mase:.4f} | WAPE: {wape:.4f}")
-
-                row = {
-                    "Window":  test_name,
-                    "Model":   model_name,
-                    "Horizon": slice_name,
-                    "n_series": n_series,
-                    "n_forecasts": n_forecasts,
-                    "WRMSSE": wrmsse,
-                    "MAE":    mae,
-                    "RMSE":   rmse,
-                    "MASE":   mase,
-                    "WAPE":   wape,
-                    "Inference_Time_Sec":              float(inf_time),
-                    "Inference_Time_Per_1k_Forecasts_Sec": float(norm_inf_time),
-                }
-                if model_name == "TFT Teacher":
-                    row["TFT_includes_lightning_overhead"] = True
-                if slice_name == "Overall (1-28)":
-                    row["hierarchy_level_wrmsses"] = level_wrmsses
-                results.append(row)
-
-    return results
-
-
-# ─── Overall-Stream Evaluator ──────────────────────────────────────────────────
-
-def evaluate_overall_stream(origins, cfg, models_info, training_data,
-                             weights_dict, scales_dict, mase_scales_dict, id_meta,
-                             ds_dir, args, device, eval_exp_dir=None, suffix=""):
-    """
-    Evaluate all models separately at each of the 52 seven-day-aligned forecast
-    origins in the held-out test stream.
-
-    Metrics are computed per-origin; the summary across origins (mean, SD, median,
-    min, max of all five metrics) is returned alongside a per-origin detail DataFrame.
-
-    Parameters
-    ----------
-    origins     : list of int — first target day of each origin
-    models_info : list of (model_name, model_obj, is_tft)
-
-    Returns
-    -------
-    summary_rows     : list of result dicts for the main CSV (mean values)
-    df_per_origin    : pd.DataFrame with per-origin detail rows
-    """
-    H = cfg.dataset.prediction_window
-    L = cfg.dataset.lookback_window
-
-    stores    = resolve_stores(cfg.environment.store_filter)
-    max_stores = getattr(cfg.environment, "max_stores", None)
-    if max_stores is not None:
-        stores = stores[:max_stores]
-
-    model_names = [name for name, _, _ in models_info]
-    per_origin_records = []
-    
-    # Resume logic
-    completed_origins = set()
-    if eval_exp_dir:
-        inc_csv = os.path.join(eval_exp_dir, f"evaluation_results_per_origin{suffix}.csv")
-        if os.path.exists(inc_csv):
-            try:
-                df_existing = pd.read_csv(inc_csv)
-                if not df_existing.empty and "Origin" in df_existing.columns:
-                    expected_models = {"Seasonal Naive", *{name for name, _, _ in models_info}}
-                    expected_horizons = {name for name, _, _ in HORIZON_SLICES}
-                    expected_combinations = {
-                        (m, h) for m in expected_models for h in expected_horizons
-                    }
-                    expected_rows = len(expected_combinations)
-                    
-                    metric_columns = ["WRMSSE", "MAE", "RMSE", "MASE", "WAPE"]
-                    for origin, group in df_existing.groupby("Origin"):
-                        combinations = set(zip(group["Model"], group["Horizon"]))
-                        metrics_valid = (
-                            group[metric_columns]
-                            .replace([np.inf, -np.inf], np.nan)
-                            .notna()
-                            .all()
-                            .all()
-                        )
-                        if len(group) == expected_rows and combinations == expected_combinations and metrics_valid:
-                            completed_origins.add(origin)
-                    
-                    if completed_origins:
-                        df_valid = df_existing[df_existing["Origin"].isin(completed_origins)]
-                        per_origin_records = df_valid.to_dict("records")
-                        print(f"Resuming from {len(completed_origins)} fully completed origins.")
-            except Exception as e:
-                print(f"Failed to load resume state: {e}")
-
-    for o_idx, o in enumerate(origins):
-        if o in completed_origins:
-            print(f"\n--- Skipping Overall Stream Origin {o_idx+1}/{len(origins)}: "
-                  f"d{o}–d{o+H-1} (Already completed) ---")
-            continue
-
-        print(f"\n--- Overall Stream Origin {o_idx+1}/{len(origins)}: "
-              f"d{o}–d{o+H-1} ---")
-
-        slice_start = o - L       # first history day (90 days before target start)
-        slice_end   = o + H - 1   # last target day
-
-        cumul_preds  = {name: [] for name in model_names}
-        all_actuals  = []
-        all_naive    = []
-        all_decoded  = []
-        model_times  = {name: 0.0 for name in model_names}
-        naive_time   = 0.0
-
-        for store in stores:
-            result = _run_store_inference(
-                store, ds_dir, training_data, cfg, args, device,
-                models_info, o, slice_start, slice_end, H
-            )
-            if result is None:
-                continue
-            all_actuals.append(result["actuals"])
-            all_naive.append(result["naive"])
-            all_decoded.append(result["decoded"].copy())
-            naive_time += result["naive_time"]
-            for name, p in result["preds"].items():
-                cumul_preds[name].append(p)
-                model_times[name] += result["model_times"][name]
-
-        # ── Aggregate across stores ────────────────────────────────────────
-        actuals         = np.concatenate(all_actuals, axis=0)
-        naive_forecasts = np.concatenate(all_naive,   axis=0)
-        concat_decoded  = pd.concat(all_decoded, ignore_index=True)
-        n_series        = actuals.shape[0]
-
-        assert n_series == FULL_M5_SERIES_COUNT, \
-            f"Dataset rule violation: origin {o} has {n_series} series " \
-            f"(expected {FULL_M5_SERIES_COUNT}). Final eval must use full population."
-
-        neural_preds = {name: np.concatenate(v, axis=0)
-                        for name, v in cumul_preds.items() if v}
-        ids = concat_decoded['id'].astype(str).values
-
-        # ── Long-form table ────────────────────────────────────────────────
-        df_long = _build_long_form_table(
-            ids, actuals, naive_forecasts, neural_preds, o, H
-        )
-        df_long = df_long.join(id_meta, on='id', how='left')
-
-        _assert_alignment(df_long, n_series * H, list(neural_preds.keys()), id_meta)
-
-        # ── Compute metrics per model per horizon slice ────────────────────
-        model_forecast_map = {"Seasonal Naive": "naive",
-                              **{name: f"pred_{name}" for name in neural_preds}}
-
-        ids_sorted   = sorted(df_long['id'].unique())
-        missing_mase_ids = [sid for sid in ids_sorted if sid not in mase_scales_dict]
-        assert not missing_mase_ids, f"Missing MASE scales for {len(missing_mase_ids)} series"
-        scales_array = np.array([mase_scales_dict[sid] for sid in ids_sorted])
-
-        for model_name, pred_col in model_forecast_map.items():
-            inf_time      = naive_time if model_name == "Seasonal Naive" else model_times[model_name]
-            n_forecasts   = n_series
-            norm_inf_time = (inf_time / n_forecasts * 1000.0) if n_forecasts > 0 else 0.0
-
-            for slice_name, s_h, e_h in HORIZON_SLICES:
-                df_slice = df_long[df_long['h'].between(s_h, e_h - 1)].copy()
-
-                act_pivot  = df_slice.pivot(index='id', columns='h', values='actual').sort_index()
-                pred_pivot = df_slice.pivot(index='id', columns='h', values=pred_col).sort_index()
-                actuals_slice   = act_pivot.values
-                forecasts_slice = pred_pivot.values
-
-                mae, rmse, wape = compute_point_metrics(
-                    actuals_slice.flatten(), forecasts_slice.flatten()
-                )
-                mase = compute_mase(actuals_slice, forecasts_slice, scales_array)
-
-                df_gt_w   = _build_wrmsse_df(df_slice, 'actual',  id_meta)
-                df_pred_w = _build_wrmsse_df(df_slice, pred_col,  id_meta)
-                wrmsse, _ = compute_hierarchical_wrmsse(
-                    df_gt_w, df_pred_w, weights_dict, scales_dict
-                )
-
-                per_origin_records.append({
-                    "Window":         "Overall Test Stream",
-                    "Origin":         o,
-                    "Target_Start":   o,
-                    "Target_End":     o + H - 1,
-                    "n_series":       n_series,
-                    "n_forecasts":    n_forecasts,
-                    "Model":          model_name,
-                    "Horizon":        slice_name,
-                    "WRMSSE":         wrmsse,
-                    "MAE":            mae,
-                    "RMSE":           rmse,
-                    "MASE":           mase,
-                    "WAPE":           wape,
-                    "Operational_Runtime_Sec":               float(inf_time),
-                    "Operational_Runtime_Per_1k_Forecasts_Sec": float(norm_inf_time),
-                    "TFT_includes_lightning_overhead": (model_name == "TFT Teacher"),
-                })
-                
-        # Incremental save
-        if eval_exp_dir:
-            inc_csv = os.path.join(eval_exp_dir, f"evaluation_results_per_origin{suffix}.csv")
-            pd.DataFrame(per_origin_records).to_csv(inc_csv, index=False)
-
-    # ── Compute summary statistics over all 52 origins ─────────────────────
-    df_per_origin = pd.DataFrame(per_origin_records)
-    summary_rows  = []
-
-    for model_name in df_per_origin['Model'].unique():
-        for slice_name in df_per_origin['Horizon'].unique():
-            df_m_h = df_per_origin[
-                (df_per_origin['Model']   == model_name) &
-                (df_per_origin['Horizon'] == slice_name)
-            ]
-            row = {
-                "Window":    "Overall Test Stream",
-                "Model":     model_name,
-                "Horizon":   slice_name,
-                "n_origins": len(df_m_h),
-                "n_series":  int(df_m_h["n_series"].mean()),
-                "n_forecasts": int(df_m_h["n_forecasts"].mean()),
-                "Inference_Time_Sec":
-                    float(df_m_h["Operational_Runtime_Sec"].sum()),
-                "Inference_Time_Per_1k_Forecasts_Sec":
-                    float(df_m_h["Operational_Runtime_Per_1k_Forecasts_Sec"].mean()),
-                "TFT_includes_lightning_overhead": (model_name == "TFT Teacher"),
-            }
-            for metric in METRICS:
-                vals = df_m_h[metric].values
-                row[metric]                = float(np.mean(vals))
-                row[f"{metric}_SD"]        = float(np.std(vals))
-                row[f"{metric}_Median"]    = float(np.median(vals))
-                row[f"{metric}_Min"]       = float(np.min(vals))
-                row[f"{metric}_Max"]       = float(np.max(vals))
-            summary_rows.append(row)
-
-    return summary_rows, df_per_origin
-
-
-# ─── Controlled Inference Benchmark ───────────────────────────────────────────
-
-def benchmark_inference(models_info, sample_batch, device,
-                        num_warmup=3, num_runs=10):
-    """
-    Controlled inference benchmark with identical timing boundaries for all models.
-
-    Uses forward adapters (forward_tft / forward_student) so that TFT is measured
-    through a simple forward pass (no Lightning Trainer), enabling fair latency
-    comparison across models.
-
-    Parameters
-    ----------
-    models_info  : list of (model_name, model_obj, is_tft)
-    sample_batch : dict (batch_x) — fixed batch used for all timed runs
-    device       : torch.device
-
-    Returns
-    -------
-    list of benchmark result dicts
-    """
-    results    = []
-    batch_size = next(
-        (v.shape[0] for v in sample_batch.values() if isinstance(v, torch.Tensor)),
-        0
-    )
-
-    # Move batch tensors to target device once
-    batch_dev = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                 for k, v in sample_batch.items()}
-
-    for model_name, model_obj, is_tft in models_info:
-        # ── Seasonal Naive: array baseline, no neural forward pass ──────────
-        if model_name == "Seasonal Naive":
-            naive_input = batch_dev.get('encoder_target', None)
-            if naive_input is None:
-                results.append({
-                    "model": model_name,
-                    "notes": "encoder_target not found in sample batch",
-                })
-                continue
-            # Warm-up
-            for _ in range(num_warmup):
-                _ = naive_input[:, -28:].clone()
-            times = []
-            for _ in range(num_runs):
-                t0 = time.perf_counter()
-                _ = naive_input[:, -28:].clone()
-                times.append(time.perf_counter() - t0)
-            results.append({
-                "model":       model_name,
-                "device":      str(device),
-                "batch_size":  batch_size,
-                "num_warmup":  num_warmup,
-                "num_runs":    num_runs,
-                "mean_ms":     float(np.mean(times) * 1000),
-                "sd_ms":       float(np.std(times)  * 1000),
-                "notes":       "array-based baseline (cloned), no model forward pass",
-            })
-            continue
-
-        # ── Neural models ────────────────────────────────────────────────────
-        forward_fn = forward_tft if is_tft else forward_student
-
-        model_obj.eval()
-        model_obj.to(device)
-
-        # Warm-up (not timed)
-        for _ in range(num_warmup):
-            with torch.inference_mode():
-                out = forward_fn(model_obj, batch_dev)
-                _ = out.sum()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-        # Timed runs
-        times = []
-        for _ in range(num_runs):
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            with torch.inference_mode():
-                out = forward_fn(model_obj, batch_dev)
-                _ = out.sum()
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            times.append(time.perf_counter() - t0)
-
-        results.append({
-            "model":       model_name,
-            "device":      str(device),
-            "batch_size":  batch_size,
-            "num_warmup":  num_warmup,
-            "num_runs":    num_runs,
-            "mean_ms":     float(np.mean(times) * 1000),
-            "sd_ms":       float(np.std(times)  * 1000),
-            "notes":       "forward only, no trainer or data loading",
-        })
-        print(f"  Benchmark {model_name:26s}: "
-              f"{float(np.mean(times)*1000):.3f} ± {float(np.std(times)*1000):.3f} ms")
-
-    return results
-
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
+            batch_target = actuals[pos]
+            assert np.allclose(raw_target, batch_target), f"Alignment audit failed for {sid} at origin {origin}!"
+        _run_alignment_audit.audited = True
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Evaluate M5 Models on ID/OOD splits and overall test stream"
-    )
-    parser.add_argument("--env",        type=str, default="local")
+    parser = argparse.ArgumentParser(description="Evaluate M5 Models")
+    parser.add_argument("--env", type=str, default="local")
     parser.add_argument("--experiment", type=str, default=None)
-    parser.add_argument("--exp-name",   type=str, default=None,
-                        help="Experiment name (required, e.g. exp_full_phase1)")
-    parser.add_argument("--teacher-checkpoint",      type=str, default=None)
+    parser.add_argument("--exp-name", type=str, required=True)
+    parser.add_argument("--teacher-checkpoint", type=str, default=None)
     parser.add_argument("--student-nokd-checkpoint", type=str, default=None)
-    parser.add_argument("--student-kd-checkpoint",   type=str, default=None)
-    parser.add_argument("--batch-size", type=int, default=256,
-                        help="Inference batch size (default: 256)")
+    parser.add_argument("--student-kd-checkpoint", type=str, default=None)
+    parser.add_argument("--batch-size", type=int, default=256)
     args = parser.parse_args()
 
-    if args.exp_name is None:
-        raise ValueError(
-            "--exp-name is required. Provide a descriptive name for this run, "
-            "e.g. --exp-name exp_full_phase1"
-        )
-
-    # ── 1. Load Configuration ─────────────────────────────────────────────
     cfg = load_config(env_name=args.env, experiment_name=args.experiment)
     set_seed(cfg.environment.seed)
+    
+    # Assert partial-data is disabled for final evaluation
+    assert getattr(cfg.environment, "max_stores", None) is None, "max_stores must be None for final evaluation"
+    assert getattr(cfg.environment, "max_batches_per_store", None) is None, "max_batches_per_store must be None for final evaluation"
 
-    # ── 2. Assert Paper Boundary Values ──────────────────────────────────
-    print("Asserting configuration boundaries against paper methodology...")
-    assert getattr(cfg.environment, "max_stores", None) is None, \
-        "Final evaluation cannot use max_stores"
-    assert getattr(cfg.environment, "max_batches_per_store", None) is None, \
-        "Final evaluation cannot use max_batches_per_store"
-    assert cfg.dataset.splits.train.end                   == 1359, "Train end mismatch"
-    assert cfg.dataset.splits.test_stream.start           == 1554, "Test stream start mismatch"
-    assert cfg.dataset.splits.test_stream.end             == 1941, "Test stream end mismatch"
-    assert cfg.dataset.splits.id_test.start               == 1554, "ID start mismatch"
-    assert cfg.dataset.splits.id_test.end                 == 1581, "ID end mismatch"
-    assert cfg.dataset.splits.ood_test.start              == 1819, "OOD start mismatch"
-    assert cfg.dataset.splits.ood_test.end                == 1846, "OOD end mismatch"
-    assert cfg.dataset.splits.extended_ood_test.start     == 1914, "Ext-OOD start mismatch"
-    assert cfg.dataset.splits.extended_ood_test.end       == 1941, "Ext-OOD end mismatch"
-    assert cfg.dataset.lookback_window   == 90, "Lookback window mismatch"
-    assert cfg.dataset.prediction_window == 28, "Prediction window mismatch"
-    assert cfg.dataset.window_stride     == 7,  "Stride mismatch"
-    print("  All configuration assertions passed.")
+    assert cfg.dataset.splits.train.end == 1359, f"Expected train.end=1359, got {cfg.dataset.splits.train.end}"
+    assert cfg.dataset.splits.test_stream.start == 1554, f"Expected test_stream.start=1554, got {cfg.dataset.splits.test_stream.start}"
+    assert cfg.dataset.splits.test_stream.end == 1941, f"Expected test_stream.end=1941, got {cfg.dataset.splits.test_stream.end}"
+    assert cfg.dataset.lookback_window == 90, f"Expected lookback=90, got {cfg.dataset.lookback_window}"
+    assert cfg.dataset.prediction_window == 28, f"Expected horizon=28, got {cfg.dataset.prediction_window}"
+    assert cfg.dataset.window_stride == 7, f"Expected stride=7, got {cfg.dataset.window_stride}"
+    assert hasattr(cfg.dataset.splits, "event_ood_test"), "Config missing event_ood_test split — check YAML key name"
+    assert cfg.dataset.splits.id_test.start == 1554 and cfg.dataset.splits.id_test.end == 1581
+    assert cfg.dataset.splits.event_ood_test.start == 1819 and cfg.dataset.splits.event_ood_test.end == 1846
+    assert cfg.dataset.splits.extended_ood_test.start == 1914 and cfg.dataset.splits.extended_ood_test.end == 1941
 
-    # ── 3. Resolve Checkpoints ────────────────────────────────────────────
     outputs_dir = resolve_path(cfg.environment.outputs_dir)
     from utils.paths import get_dataset_dir
-
+    ds_dir = get_dataset_dir(cfg)
+    
     teacher_chk = resolve_model_checkpoint(
         args.teacher_checkpoint, cfg.evaluation.teacher_checkpoint, outputs_dir,
         os.path.join("teacher", args.exp_name, "best_tft_teacher.ckpt")
@@ -1196,312 +885,400 @@ def main():
         args.student_kd_checkpoint, cfg.evaluation.student_kd_checkpoint, outputs_dir,
         os.path.join("student", "kd", args.exp_name, "best_student.ckpt")
     )
+
     print("\nResolved checkpoints:")
-    teacher_hash = sha256_file(teacher_chk)
-    student_nokd_hash = sha256_file(student_nokd_chk)
-    student_kd_hash = sha256_file(student_kd_chk)
-    print(f"  Teacher:          {teacher_chk} (SHA256: {teacher_hash[:8]})")
-    print(f"  Student (No KD):  {student_nokd_chk} (SHA256: {student_nokd_hash[:8]})")
-    print(f"  Student (KD):     {student_kd_chk} (SHA256: {student_kd_hash[:8]})")
+    print(f"Teacher: {teacher_chk}")
+    print(f"Student (No KD): {student_nokd_chk}")
+    print(f"Student (KD): {student_kd_chk}")
 
-    # ── 4. Load Data ──────────────────────────────────────────────────────
-    ds_dir = get_dataset_dir(cfg)
-    df = load_dataset_from_cache(
-        artifacts_dir=ds_dir,
-        store_filter=cfg.environment.store_filter
-    )
-    if df is None:
-        raise FileNotFoundError(
-            f"Preprocessed cache not found for store filter: "
-            f"'{cfg.environment.store_filter}'. Run prepare_dataset.py first."
-        )
-
-    # ── 5. Build Base Training Dataset ───────────────────────────────────
-    print("Building base training dataset...")
+    df = load_dataset_from_cache(artifacts_dir=ds_dir, store_filter=cfg.environment.store_filter)
+    
     training_data = build_timeseries_dataset(df, cfg, is_train=True)
-
-    # ── 6. Build ID Hierarchy Metadata ───────────────────────────────────
-    id_meta_source = df[['id'] + HIERARCHY_COLS].copy()
-    id_meta_source['id'] = id_meta_source['id'].astype(str)
-    for hcol in HIERARCHY_COLS:
-        if hcol in id_meta_source.columns:
-            id_meta_source[hcol] = id_meta_source[hcol].astype(str)
-
-    id_meta = (id_meta_source
-               .drop_duplicates('id')
-               .set_index('id'))
-    print(f"  id_meta built: {len(id_meta)} unique series")
-
-    # ── 7. Load Models ────────────────────────────────────────────────────
-    print("Loading models from checkpoints...")
-    teacher      = TemporalFusionTransformer.load_from_checkpoint(teacher_chk)
-    student_nokd = M5TransformerStudent.load_from_checkpoint(
-        student_nokd_chk, training_dataset=training_data, strict=True
-    )
-    student_kd = M5TransformerStudent.load_from_checkpoint(
-        student_kd_chk, training_dataset=training_data, strict=True
-    )
+    
+    teacher = TemporalFusionTransformer.load_from_checkpoint(teacher_chk)
+    student_nokd = M5TransformerStudent.load_from_checkpoint(student_nokd_chk, training_dataset=training_data, strict=True)
+    student_kd = M5TransformerStudent.load_from_checkpoint(student_kd_chk, training_dataset=training_data, strict=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    teacher.to(device)
-    student_nokd.to(device)
-    student_kd.to(device)
+    teacher = teacher.to(device).eval()
+    student_nokd = student_nokd.to(device).eval()
+    student_kd = student_kd.to(device).eval()
 
-    # models_info: list of (model_name, model_obj, is_tft)
-    models_info = [
-        ("TFT Teacher",       teacher,      True),
-        ("Student Without KD", student_nokd, False),
-        ("Student With KD",    student_kd,   False),
-    ]
-
-    # ── 8. Precompute Scales ──────────────────────────────────────────────
     train_end = cfg.dataset.splits.train.end
-    df_train  = df[df['time_idx'] <= train_end].copy()
+    df_train = df[df['time_idx'] <= train_end].copy()
+    weights_dict, scales_dict, scale_diag = compute_wrmsse_weights_and_scales(df_train, train_end)
+    mase_scales_dict = compute_mase_scales(df_train, train_end)
+    series_ids = df['id'].astype(str).drop_duplicates().sort_values().to_numpy()
+    assert len(series_ids) == FULL_M5_SERIES_COUNT
+    missing_mase = [sid for sid in series_ids if sid not in mase_scales_dict]
+    assert not missing_mase, f"Missing MASE scales for {len(missing_mase)} series"
+    scales_array = np.array([mase_scales_dict[sid] for sid in series_ids])
 
-    weights_dict, scales_dict, scale_diagnostics = compute_wrmsse_weights_and_scales(
-        df_train, train_end
+    # --- Controlled latency benchmark (separate from operational timing) ---
+    print("\nRunning controlled inference benchmark...")
+    _bench_store = resolve_stores(cfg.environment.store_filter)[0]
+    _bench_df = load_from_cache(artifacts_dir=ds_dir, store_filter=_bench_store)
+    _bench_slice = _bench_df[
+        (_bench_df['time_idx'] >= train_end - cfg.dataset.lookback_window + 1) &
+        (_bench_df['time_idx'] <= train_end + cfg.dataset.prediction_window)
+    ].copy()
+    del _bench_df
+    for col in ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id',
+                'weekday', 'month', 'year', 'event_name_1', 'event_type_1']:
+        if col in _bench_slice.columns:
+            _bench_slice[col] = _bench_slice[col].astype(str).astype('category')
+    _bench_ds = TimeSeriesDataSet.from_dataset(training_data, _bench_slice, predict=True, stop_randomization=True)
+    _bench_loader = _bench_ds.to_dataloader(train=False, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    _bench_batch_x, _ = next(iter(_bench_loader))
+    del _bench_slice, _bench_ds, _bench_loader
+    benchmark_models_info = [
+        ("Seasonal Naive", None, False),
+        ("TFT Teacher", teacher, True),
+        ("Student Without KD", student_nokd, False),
+        ("Student With KD", student_kd, False),
+    ]
+    bench_results = benchmark_inference(benchmark_models_info, _bench_batch_x, device)
+    bench_csv = os.path.join(
+        os.path.join(resolve_path(cfg.environment.outputs_dir), "evaluation", args.exp_name),
+        "benchmark_results.csv"
     )
-    mase_scales_dict = compute_mase_scales(df_train)
+    os.makedirs(os.path.dirname(bench_csv), exist_ok=True)
+    pd.DataFrame(bench_results).to_csv(bench_csv, index=False)
+    del _bench_batch_x
+    gc.collect()
 
-    # ── 9. Prepare Output Directory ──────────────────────────────────────
+    results = []
+
+    diagnostics_dict = {}
+    
+    windows = [
+        ("ID Reference", cfg.dataset.splits.id_test.start, cfg.dataset.splits.id_test.end),
+        ("Event-Intensive OOD", cfg.dataset.splits.event_ood_test.start, cfg.dataset.splits.event_ood_test.end),
+        ("Extended-Gap OOD", cfg.dataset.splits.extended_ood_test.start, cfg.dataset.splits.extended_ood_test.end)
+    ]
+    
+    test_stream_start = cfg.dataset.splits.test_stream.start
+    test_stream_end = cfg.dataset.splits.test_stream.end
+    H = cfg.dataset.prediction_window
+    L = cfg.dataset.lookback_window
+
+    overall_origins = list(range(test_stream_start, test_stream_end - H + 2, 7))
+    assert len(overall_origins) == 52, f"Expected 52 origins, got {len(overall_origins)}"
+    assert overall_origins[0] == 1554
+    assert overall_origins[-1] == 1911
+    assert overall_origins[-1] + H - 1 == 1938
+    for origin in overall_origins:
+        windows.append((f"Overall Test Stream (Origin {origin})", origin, origin + H - 1))
+
     eval_exp_dir = os.path.join(outputs_dir, "evaluation", args.exp_name)
     os.makedirs(eval_exp_dir, exist_ok=True)
+    inc_csv = os.path.join(eval_exp_dir, "evaluation_results_incremental.csv")
+    run_state_path = os.path.join(eval_exp_dir, "run_state.json")
 
-    suffix = f"_{cfg.environment.store_filter}" if cfg.environment.store_filter else "_full"
-    
-    # ── 9a. Save / Check Run State for Resume Protection ───────────────────
-    script_hash = sha256_file(os.path.abspath(__file__))
-    current_run_state = {
-        "evaluation_script_hash": script_hash,
+    def get_hash(path):
+        with open(path, "rb") as _f:
+            return hashlib.sha256(_f.read()).hexdigest()
+
+    with open(__file__, "rb") as _f:
+        script_hash = hashlib.sha256(_f.read()).hexdigest()
+
+    teacher_hash = get_hash(teacher_chk)
+    student_nokd_hash = get_hash(student_nokd_chk)
+    student_kd_hash = get_hash(student_kd_chk)
+
+    run_state = {
+        "script_hash": script_hash,
         "teacher_hash": teacher_hash,
         "student_nokd_hash": student_nokd_hash,
         "student_kd_hash": student_kd_hash,
-        "train_end": cfg.dataset.splits.train.end,
-        "test_stream_start": cfg.dataset.splits.test_stream.start,
-        "test_stream_end": cfg.dataset.splits.test_stream.end,
-        "lookback": cfg.dataset.lookback_window,
-        "horizon": cfg.dataset.prediction_window,
-        "stride": cfg.dataset.window_stride,
-        "seed": cfg.environment.seed,
-        "expected_series": FULL_M5_SERIES_COUNT
+        "train_end": int(cfg.dataset.splits.train.end),
+        "test_stream_start": int(cfg.dataset.splits.test_stream.start),
+        "test_stream_end": int(cfg.dataset.splits.test_stream.end),
+        "lookback": int(cfg.dataset.lookback_window),
+        "horizon": int(cfg.dataset.prediction_window),
+        "stride": int(cfg.dataset.window_stride),
+        "seed": int(cfg.environment.seed),
+        "series_count": FULL_M5_SERIES_COUNT,
     }
-    state_path = os.path.join(eval_exp_dir, f"resume_state{suffix}.json")
-    if os.path.exists(state_path):
-        with open(state_path, "r") as f:
-            prev_state = json.load(f)
-        if prev_state != current_run_state:
-            raise ValueError(
-                f"Cannot resume experiment '{args.exp_name}'. Run state configuration or "
-                f"checkpoint hashes differ from the previous run.\n"
-                f"Please use a new --exp-name or clear the old evaluation folder."
+
+    expected_models = {"Seasonal Naive", "TFT Teacher", "Student Without KD", "Student With KD"}
+    expected_horizons = {"Overall (1-28)", "Short (1-7)", "Medium (8-14)", "Long (15-28)"}
+    expected_pairs = {(m, h) for m in expected_models for h in expected_horizons}
+
+    completed_origins = set()
+    if os.path.exists(inc_csv) and os.path.exists(run_state_path):
+        with open(run_state_path, "r") as _f:
+            saved_state = json.load(_f)
+        if saved_state != run_state:
+            raise RuntimeError(
+                "Incremental CSV exists but run state does not match current run. "
+                "Use a different --exp-name or delete the existing output directory."
             )
-    else:
-        with open(state_path, "w") as f:
-            json.dump(current_run_state, f, indent=2)
+        df_inc = pd.read_csv(inc_csv)
+        if not df_inc.empty:
+            for w, group in df_inc.groupby('Window'):
+                actual_pairs = set(zip(group["Model"], group["Horizon"]))
+                if (
+                    len(group) == 16
+                    and actual_pairs == expected_pairs
+                    and np.isfinite(group[['WRMSSE', 'MAE', 'RMSE', 'MASE', 'WAPE']].values).all()
+                ):
+                    completed_origins.add(w)
+            if completed_origins:
+                df_inc = df_inc[df_inc["Window"].isin(completed_origins)].copy()
+                results = df_inc.to_dict("records")
+                df_inc.to_csv(inc_csv, index=False)
+                print(
+                    f"Resuming from {len(completed_origins)} "
+                    "fully completed windows."
+                )
+            else:
+                results = []
+    elif os.path.exists(inc_csv) and not os.path.exists(run_state_path):
+        raise RuntimeError(
+            "Incremental CSV exists but no run_state.json found. "
+            "Cannot safely resume. Use a different --exp-name or delete the existing output directory."
+        )
 
-    # Save scale diagnostics for audit
-    diag_path = os.path.join(eval_exp_dir, f"wrmsse_scale_diagnostics{suffix}.json")
-    with open(diag_path, "w") as f:
-        json.dump(scale_diagnostics, f, indent=2)
-    print(f"WRMSSE scale diagnostics saved to: {diag_path}")
+    with open(run_state_path, "w") as _f:
+        json.dump(run_state, _f, indent=2)
 
-    # ── 10. Fixed-Window Evaluation ───────────────────────────────────────
-    scenarios = [
-        ("ID Reference",       cfg.dataset.splits.id_test.start,
-                               cfg.dataset.splits.id_test.end),
-        ("Event-Intensive OOD", cfg.dataset.splits.ood_test.start,
-                                cfg.dataset.splits.ood_test.end),
-        ("Extended-Gap OOD",   cfg.dataset.splits.extended_ood_test.start,
-                               cfg.dataset.splits.extended_ood_test.end),
+    models_eval = [
+        ("TFT Teacher", teacher),
+        ("Student Without KD", student_nokd),
+        ("Student With KD", student_kd)
     ]
-
-    fixed_results = evaluate_fixed_window(
-        scenarios, df, cfg, models_info, training_data,
-        weights_dict, scales_dict, mase_scales_dict, id_meta,
-        ds_dir, args, device
-    )
-
-    # ── 11. Overall Test Stream Evaluation ────────────────────────────────
-    H      = cfg.dataset.prediction_window
-    stride = cfg.dataset.window_stride
-    test_stream_start = cfg.dataset.splits.test_stream.start
-    test_stream_end   = cfg.dataset.splits.test_stream.end
-
-    origins = list(range(test_stream_start, test_stream_end - H + 2, stride))
-    assert len(origins) == 52, \
-        f"Expected 52 overall-stream origins, got {len(origins)}"
-    print(f"\nOverall stream: {len(origins)} eligible origins "
-          f"(d{origins[0]}–d{origins[-1]}), last target day d{origins[-1]+H-1}.")
-
-    stream_summary, df_per_origin = evaluate_overall_stream(
-        origins, cfg, models_info, training_data,
-        weights_dict, scales_dict, mase_scales_dict, id_meta,
-        ds_dir, args, device, eval_exp_dir, suffix
-    )
-
-    # ── 12. Collect Sample Batch for Benchmark ────────────────────────────
-    print("\nCollecting sample batch for inference benchmark...")
-    sample_batch = None
-    stores_list  = resolve_stores(cfg.environment.store_filter)
-    max_stores   = getattr(cfg.environment, "max_stores", None)
-    if max_stores:
-        stores_list = stores_list[:max_stores]
-
-    L_bench = cfg.dataset.lookback_window
-    for store in stores_list[:1]:
-        df_part = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
-        if df_part is None:
-            continue
-        o_ref = origins[0]
-        df_sliced = df_part[
-            (df_part['time_idx'] >= o_ref - L_bench) &
-            (df_part['time_idx'] <= o_ref + H - 1)
-        ].copy()
-        for col in CAT_COLS:
-            if col in df_sliced.columns:
-                df_sliced[col] = df_sliced[col].astype(str).astype('category')
-        if len(df_sliced) == 0:
-            continue
-        part_ds     = TimeSeriesDataSet.from_dataset(
-            training_data, df_sliced, predict=True, stop_randomization=True
-        )
-        part_loader = part_ds.to_dataloader(
-            train=False, batch_size=args.batch_size, shuffle=False,
-            num_workers=cfg.environment.num_workers
-        )
-        for batch_x, _ in part_loader:
-            sample_batch = {k: v for k, v in batch_x.items()}
-            break
-        del part_loader, part_ds
-        break
-
-    # ── 13. Controlled Inference Benchmark ────────────────────────────────
-    benchmark_results = []
-    if sample_batch is not None:
-        print("\n--- Controlled Inference Benchmark ---")
-        # Include Seasonal Naive as a named entry (no model object needed)
-        benchmark_models_info = [
-            ("Seasonal Naive",    None,        False),
-        ] + models_info
-        benchmark_results = benchmark_inference(
-            benchmark_models_info, sample_batch, device,
-            num_warmup=3, num_runs=10
-        )
-    else:
-        print("WARNING: Could not collect sample batch; benchmark skipped.")
-
-    # ── 14. Save All Results ──────────────────────────────────────────────
-    # 14a. Main evaluation CSV (64 rows: 4 models × 4 windows × 4 slices)
-    all_fixed_results = []
-    for r in fixed_results:
-        # Drop the hierarchy diagnostic from CSV rows
-        row = {k: v for k, v in r.items() if k != "hierarchy_level_wrmsses"}
-        all_fixed_results.append(row)
-
-    all_stream_results = []
-    for r in stream_summary:
-        all_stream_results.append(r)
-
-    df_res = pd.DataFrame(all_fixed_results + all_stream_results)
-    csv_path = os.path.join(eval_exp_dir, f"evaluation_results{suffix}.csv")
-    df_res.to_csv(csv_path, index=False)
-    print(f"\nSaved evaluation results to: {csv_path}")
-
-    # 14b. Per-origin CSV (832 rows: 4 models × 52 origins × 4 slices)
-    per_origin_csv = os.path.join(
-        eval_exp_dir, f"evaluation_results_per_origin{suffix}.csv"
-    )
-    df_per_origin.to_csv(per_origin_csv, index=False)
-    print(f"Saved per-origin results to: {per_origin_csv}")
-
-    # 14c. Benchmark CSV (4 rows: one per model)
-    if benchmark_results:
-        bench_csv = os.path.join(eval_exp_dir, f"benchmark_inference{suffix}.csv")
-        pd.DataFrame(benchmark_results).to_csv(bench_csv, index=False)
-        print(f"Saved inference benchmark to: {bench_csv}")
-
-    # 14d. Config snapshot
-    config_save_path = os.path.join(eval_exp_dir, "config.yaml")
-    save_config(cfg, config_save_path)
-    print(f"Merged config saved to: {config_save_path}")
-
-    # ── 15. Print Relative Degradation ───────────────────────────────────
-    print("\n--- Relative ID-to-OOD Performance Degradation (Overall 1-28) ---")
-    all_model_names = ["Seasonal Naive", "TFT Teacher",
-                       "Student Without KD", "Student With KD"]
-    for m in all_model_names:
-        df_m = df_res[
-            (df_res["Model"] == m) & (df_res["Horizon"] == "Overall (1-28)")
-        ]
-        if df_m.empty:
-            continue
-        try:
-            id_err       = df_m[df_m["Window"] == "ID Reference"]["WRMSSE"].values[0]
-            event_ood_err = df_m[df_m["Window"] == "Event-Intensive OOD"]["WRMSSE"].values[0]
-            ext_ood_err  = df_m[df_m["Window"] == "Extended-Gap OOD"]["WRMSSE"].values[0]
-            deg_event = ((event_ood_err - id_err) / id_err) * 100
-            deg_ext   = ((ext_ood_err   - id_err) / id_err) * 100
-            print(f"  {m:26s} -> ID: {id_err:.4f} | "
-                  f"Event-OOD: {event_ood_err:.4f} ({deg_event:+.2f}%) | "
-                  f"Ext-OOD: {ext_ood_err:.4f} ({deg_ext:+.2f}%)")
-        except IndexError:
-            print(f"  {m}: insufficient data for degradation calculation")
-
-    # ── 16. Print Deployment Complexity ──────────────────────────────────
-    print("\n--- Model Deployment Complexity ---")
-    t_params  = sum(p.numel() for p in teacher.parameters())
-    t_size_mb = os.path.getsize(teacher_chk) / 1e6
-    print(f"  TFT Teacher          -> Parameters: {t_params/1e3:.1f}k | "
-          f"Checkpoint: {t_size_mb:.2f} MB")
-    s_params  = sum(p.numel() for p in student_nokd.parameters())
-    s_size_mb = os.path.getsize(student_nokd_chk) / 1e6
-    print(f"  Transformer Student  -> Parameters: {s_params/1e3:.1f}k | "
-          f"Checkpoint: {s_size_mb:.2f} MB")
     
-    parameter_ratio = t_params / s_params
-    parameter_reduction_pct = (1.0 - s_params / t_params) * 100.0
-    print(f"  Teacher/Student Parameter Ratio -> {parameter_ratio:.2f}x")
-    print(f"  Student Parameter Reduction     -> {parameter_reduction_pct:.1f}%")
 
-    # ── 17. Save Metadata ─────────────────────────────────────────────────
-    models_summary = {}
-    for m in all_model_names:
-        models_summary[m] = {}
-        for w in ["ID Reference", "Event-Intensive OOD",
-                  "Extended-Gap OOD", "Overall Test Stream"]:
-            df_m_w = df_res[
-                (df_res["Model"]   == m) &
-                (df_res["Window"]  == w) &
-                (df_res["Horizon"] == "Overall (1-28)")
-            ]
-            if df_m_w.empty:
-                continue
-            models_summary[m][w] = {
-                metric: float(df_m_w[metric].values[0])
-                for metric in METRICS
-                if metric in df_m_w.columns
-            }
 
+    for test_name, start_day, end_day in windows:
+        if test_name in completed_origins:
+            continue
+            
+        print(f"\n--- Evaluating Models on {test_name} (Days {start_day} to {end_day}) ---")
+        
+        df_test_gt = df[(df['time_idx'] >= start_day) & (df['time_idx'] <= end_day)].copy()
+        df_test_gt['id'] = df_test_gt['id'].astype(str)
+        df_test_gt = df_test_gt.sort_values(by=['id', 'time_idx']).reset_index(drop=True)
+        
+        start_t = time.perf_counter()
+        df_naive_source = df[(df['time_idx'] >= (start_day - 28)) & (df['time_idx'] < start_day)].copy()
+        df_naive_source['id'] = df_naive_source['id'].astype(str)
+        df_naive_source = df_naive_source.sort_values(by=['id', 'time_idx']).reset_index(drop=True)
+        naive_time = time.perf_counter() - start_t
+        
+        stores = resolve_stores(cfg.environment.store_filter)
+        min_idx = start_day - L
+        
+        all_actuals = []
+        all_naive = []
+        all_decoded = []
+        model_preds = {n: [] for n, _ in models_eval}
+        model_times = {n: 0.0 for n, _ in models_eval}
+        
+        for store in stores:
+            df_part = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
+            if df_part is None: continue
+            
+            df_part_sliced = df_part[(df_part['time_idx'] >= min_idx) & (df_part['time_idx'] <= end_day)].copy()
+            del df_part
+            
+            for col in ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id', 'weekday', 'month', 'year', 'event_name_1', 'event_type_1']:
+                if col in df_part_sliced.columns:
+                    df_part_sliced[col] = df_part_sliced[col].astype(str).astype('category')
+                    
+            if len(df_part_sliced) == 0: continue
+            
+            part_ds = TimeSeriesDataSet.from_dataset(training_data, df_part_sliced, predict=True, stop_randomization=True)
+            _decoded = part_ds.decoded_index
+            assert _decoded["time_idx_first_prediction"].nunique() == 1, "Multiple prediction starts in one store partition"
+            assert int(_decoded["time_idx_first_prediction"].iloc[0]) == start_day, f"Prediction start mismatch: expected {start_day}, got {_decoded['time_idx_first_prediction'].iloc[0]}"
+            assert _decoded["id"].is_unique, "Duplicate series IDs in store partition"
+            part_loader = part_ds.to_dataloader(train=False, batch_size=args.batch_size, shuffle=False, num_workers=cfg.environment.num_workers)
+            
+            store_actuals = []
+            store_naive = []
+            for batch_x, batch_y in part_loader:
+                target = batch_y[0] if isinstance(batch_y, (tuple, list)) else batch_y
+                store_actuals.append(target.cpu().numpy())
+                store_naive.append(batch_x['encoder_target'][:, -28:].cpu().numpy())
+            
+            actuals_np = np.concatenate(store_actuals, axis=0)
+            naive_np = np.concatenate(store_naive, axis=0)
+
+            assert actuals_np.shape[1] == H, f"Expected H={H} targets, got {actuals_np.shape[1]}"
+            assert naive_np.shape == actuals_np.shape, "Naive shape mismatch"
+            assert np.isfinite(actuals_np).all(), f"Non-finite actuals for store={store}, window={test_name}"
+            assert np.isfinite(naive_np).all(), f"Non-finite naive for store={store}, window={test_name}"
+
+            all_actuals.append(actuals_np)
+            all_naive.append(naive_np)
+            all_decoded.append(part_ds.decoded_index)
+            
+            _run_alignment_audit(df_part_sliced, part_ds.decoded_index, start_day, H, actuals_np)
+            del df_part_sliced
+            
+            for m_name, m_obj in models_eval:
+                st = time.perf_counter()
+                preds = get_predictions(m_obj, part_loader)
+                assert preds.shape == actuals_np.shape, (
+                    f"{m_name} shape mismatch: predictions={preds.shape}, targets={actuals_np.shape}"
+                )
+                assert np.isfinite(preds).all(), (
+                    f"Non-finite predictions from {m_name} for store={store}, window={test_name}"
+                )
+                model_times[m_name] += time.perf_counter() - st
+                model_preds[m_name].append(preds)
+            
+            del part_loader, part_ds
+            gc.collect()
+            
+        concatenated_decoded = pd.concat(all_decoded, ignore_index=True)
+        concatenated_decoded['id'] = concatenated_decoded['id'].astype(str)
+        order = concatenated_decoded.assign(row_idx=np.arange(len(concatenated_decoded))).sort_values('id')['row_idx'].to_numpy()
+        
+        actuals = np.concatenate(all_actuals, axis=0)[order]
+        naive_forecasts = np.concatenate(all_naive, axis=0)[order]
+        for m_name in model_preds:
+            model_preds[m_name] = np.concatenate(model_preds[m_name], axis=0)[order]
+            
+        decoded_ids_sorted = concatenated_decoded.sort_values('id')['id'].to_numpy()
+        ground_truth_ids = df_test_gt['id'].drop_duplicates().to_numpy()
+        assert np.array_equal(decoded_ids_sorted, ground_truth_ids), "Alignment failed!"
+        
+        num_series = actuals.shape[0]
+        assert num_series == FULL_M5_SERIES_COUNT, f"Expected {FULL_M5_SERIES_COUNT} series, got {num_series}"
+        assert naive_forecasts.shape == actuals.shape
+        assert np.isfinite(actuals).all()
+        assert np.isfinite(naive_forecasts).all()
+        
+        models_final = [("Seasonal Naive", naive_forecasts, naive_time)]
+        for m_name, _ in models_eval:
+            preds = model_preds[m_name]
+            assert preds.shape == actuals.shape
+            assert np.isfinite(preds).all()
+            models_final.append((m_name, preds, model_times[m_name]))
+            
+        slices = [
+            ("Overall (1-28)", 0, 28),
+            ("Short (1-7)", 0, 7),
+            ("Medium (8-14)", 7, 14),
+            ("Long (15-28)", 14, 28)
+        ]
+        
+        window_results = []
+        for name, forecasts, inf_time in models_final:
+            normalized_inf_time = (inf_time / num_series) * 1000.0
+            
+            for slice_name, start_idx, end_idx in slices:
+                actuals_slice = actuals[:, start_idx:end_idx]
+                forecasts_slice = forecasts[:, start_idx:end_idx]
+                
+                slice_start_day = start_day + start_idx
+                slice_end_day = start_day + end_idx - 1
+                
+                df_test_gt_slice = df_test_gt[(df_test_gt['time_idx'] >= slice_start_day) & (df_test_gt['time_idx'] <= slice_end_day)].copy()
+                df_preds_slice = df_test_gt_slice.copy()
+                df_preds_slice['sales'] = forecasts_slice.flatten()
+                
+                mae, rmse, wape = compute_point_metrics(actuals_slice.flatten(), forecasts_slice.flatten())
+                wrmsse, level_wrmsses = compute_hierarchical_wrmsse(df_test_gt_slice, df_preds_slice, weights_dict, scales_dict)
+                mase = compute_mase(actuals_slice, forecasts_slice, scales_array)
+                
+                if slice_name == "Overall (1-28)":
+                    diagnostics_dict[(name, test_name)] = level_wrmsses
+                
+                window_results.append({
+                    "Window": test_name,
+                    "Model": name,
+                    "Horizon": slice_name,
+                    "WRMSSE": float(wrmsse),
+                    "MAE": float(mae),
+                    "RMSE": float(rmse),
+                    "MASE": float(mase),
+                    "WAPE": float(wape),
+                    "Inference_Time_Sec": float(inf_time),
+                    "Inference_Time_Per_1k_Sec": float(normalized_inf_time)
+                })
+        
+        results.extend(window_results)
+        pd.DataFrame(results).to_csv(inc_csv, index=False)
+        gc.collect()
+
+    df_res = pd.DataFrame(results)
+    
+    # Calculate Summary for Overall Test Stream
+    overall_rows = df_res[df_res['Window'].str.startswith('Overall Test Stream (Origin ')]
+    if not overall_rows.empty:
+        summary_rows = []
+        for model in overall_rows['Model'].unique():
+            for horizon in overall_rows['Horizon'].unique():
+                subset = overall_rows[(overall_rows['Model'] == model) & (overall_rows['Horizon'] == horizon)]
+                metrics = subset[['WRMSSE', 'MAE', 'RMSE', 'MASE', 'WAPE']]
+                
+                mean_dict = metrics.mean().to_dict()
+                std_dict = metrics.std().to_dict()
+                median_dict = metrics.median().to_dict()
+                min_dict = metrics.min().to_dict()
+                max_dict = metrics.max().to_dict()
+                
+                row = {"Window": "Overall Test Stream", "Model": model, "Horizon": horizon}
+                for k in metrics.columns:
+                    row[k] = mean_dict[k]
+                    row[f"{k}_SD"] = std_dict[k]
+                    row[f"{k}_Median"] = median_dict[k]
+                    row[f"{k}_Min"] = min_dict[k]
+                    row[f"{k}_Max"] = max_dict[k]
+                summary_rows.append(row)
+        
+        df_summary = pd.DataFrame(summary_rows)
+        df_final = pd.concat([df_res[~df_res['Window'].str.startswith('Overall Test Stream (Origin ')], df_summary], ignore_index=True)
+    else:
+        df_final = df_res
+
+    csv_filepath = os.path.join(eval_exp_dir, "evaluation_results_final.csv")
+    df_final.to_csv(csv_filepath, index=False)
+
+    # --- Relative degradation: ID vs OOD ---
+    degradation_rows = []
+    for model_name in expected_models:
+        rows = df_final[
+            (df_final["Model"] == model_name) &
+            (df_final["Horizon"] == "Overall (1-28)")
+        ]
+        id_row = rows[rows["Window"] == "ID Reference"]
+        event_row = rows[rows["Window"] == "Event-Intensive OOD"]
+        extended_row = rows[rows["Window"] == "Extended-Gap OOD"]
+        assert len(id_row) == 1, f"Expected 1 ID Reference row for {model_name}"
+        assert len(event_row) == 1, f"Expected 1 Event-Intensive OOD row for {model_name}"
+        assert len(extended_row) == 1, f"Expected 1 Extended-Gap OOD row for {model_name}"
+        for metric in ["WRMSSE", "MAE", "RMSE", "MASE", "WAPE"]:
+            id_value = float(id_row.iloc[0][metric])
+            event_value = float(event_row.iloc[0][metric])
+            extended_value = float(extended_row.iloc[0][metric])
+            degradation_rows.append({
+                "Model": model_name,
+                "Metric": metric,
+                "ID_to_Event_OOD_Percent": ((event_value - id_value) / id_value) * 100,
+                "ID_to_Extended_OOD_Percent": ((extended_value - id_value) / id_value) * 100,
+            })
+    pd.DataFrame(degradation_rows).to_csv(
+        os.path.join(eval_exp_dir, "relative_degradation.csv"), index=False
+    )
+    
     save_metadata(
         eval_exp_dir,
         cfg.environment.seed,
         additional_fields={
+            "script_hash": script_hash,
             "checkpoints": {
-                "teacher":     {"path": teacher_chk, "sha256": teacher_hash},
+                "teacher": {"path": teacher_chk, "sha256": teacher_hash},
                 "student_nokd": {"path": student_nokd_chk, "sha256": student_nokd_hash},
-                "student_kd":  {"path": student_kd_chk, "sha256": student_kd_hash},
+                "student_kd": {"path": student_kd_chk, "sha256": student_kd_hash}
             },
-            "overall_stream_origins": {
-                "count":      len(origins),
-                "first":      origins[0],
-                "last":       origins[-1],
-                "last_target_day": origins[-1] + H - 1,
-            },
-            "metrics_summary": models_summary,
-        },
+            "wrmsse_scale_diagnostics": scale_diag
+        }
     )
-    print(f"\nEvaluation complete. Outputs saved to: {eval_exp_dir}")
-
 
 if __name__ == "__main__":
     main()
