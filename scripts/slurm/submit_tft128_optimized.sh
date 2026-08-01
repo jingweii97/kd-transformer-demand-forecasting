@@ -13,14 +13,14 @@
 set -e
 EXP_NAME="tft128_optimized"
 
-if [ -d "outputs/teacher/$EXP_NAME" ]; then
-    echo "Error: Output directory outputs/teacher/$EXP_NAME already exists. Aborting to prevent overwrite."
-    exit 1
-fi
-
 # Execute HPC storage setup helper if on cluster
 if [ -f "scripts/slurm/setup_hpc_storage.sh" ]; then
     bash scripts/slurm/setup_hpc_storage.sh || true
+fi
+
+if [ -d "outputs/teacher/$EXP_NAME" ]; then
+    echo "Error: Output directory outputs/teacher/$EXP_NAME already exists. Aborting to prevent overwrite."
+    exit 1
 fi
 
 module load miniconda/24.1.2 2>/dev/null || module load miniconda/3 2>/dev/null || echo "[Info] Using default system conda"
@@ -36,7 +36,7 @@ echo "INITIAL GLOBAL STEP: 0"
 echo "TFT-64 ARTIFACTS WILL NOT BE LOADED"
 
 # Train command
-python scripts/train_teacher.py --env dicc --experiment ../experiments/tft128_optimized --exp-name "$EXP_NAME" "$@"
+python scripts/train_teacher.py --env dicc --experiment tft128_optimized --exp-name "$EXP_NAME" "$@"
 
 # Run verification
 python scripts/verify_tft_run.py --exp-name "$EXP_NAME" --hidden-size 128

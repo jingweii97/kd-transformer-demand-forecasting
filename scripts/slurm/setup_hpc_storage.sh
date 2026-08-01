@@ -33,6 +33,8 @@ mkdir -p "$SCRATCH_BASE/m5_artifacts"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
+mkdir -p logs/slurm
+
 
 # Symlink outputs directory if not already linked
 if [ ! -L "outputs" ]; then
