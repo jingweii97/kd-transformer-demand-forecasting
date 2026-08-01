@@ -22,14 +22,14 @@ class ObservabilityCallback(pl.Callback):
         if self.last_lr is not None and current_lr < self.last_lr:
             self.reduction_events += 1
         self.last_lr = current_lr
-        
-        # Log current learning rate
-        pl_module.log("learning_rate", current_lr, on_epoch=True, prog_bar=False)
 
     def on_train_epoch_end(self, trainer, pl_module):
+        if self.last_lr is not None:
+            pl_module.log("learning_rate", self.last_lr, on_epoch=True, prog_bar=False)
         if self.epoch_start_time:
             epoch_duration = time.time() - self.epoch_start_time
             pl_module.log("epoch_duration", epoch_duration, on_epoch=True, prog_bar=False)
+
 
     def on_train_end(self, trainer, pl_module):
         if self.training_start_time:

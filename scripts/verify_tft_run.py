@@ -82,10 +82,13 @@ def main():
         print(f"ERROR: Expected hidden_size {args.hidden_size}, got {h_size}")
         sys.exit(1)
         
-    hc_size = model.hparams.get("hidden_continuous_size", 8)
+    hc_size = getattr(model.hparams, "hidden_continuous_size", None)
+    if hc_size is None and hasattr(model.hparams, "get"):
+        hc_size = model.hparams.get("hidden_continuous_size", 8)
     if hc_size != 8:
         print(f"ERROR: Expected hidden_continuous_size 8, got {hc_size}")
         sys.exit(1)
+
 
     # 11. Checkpoint epoch and global step
     try:

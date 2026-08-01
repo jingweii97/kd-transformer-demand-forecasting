@@ -196,9 +196,62 @@ def main():
     print(f"Training completed. Best model checkpoint saved to: {best_path}")
     
     # Save experiment metadata
+    import hashlib
+    checkpoint_hashes = []
+    best_validation_loss = None
+    for f in os.listdir(exp_dir):
+        if f.endswith(".ckpt"):
+            ckpt_p = os.path.join(exp_dir, f)
+            sz = os.path.getsize(ckpt_p)
+            hasher = hashlib.sha256()
+            with open(ckpt_p, 'rb') as fp:
+                hasher.update(fp.read())
+            sha256 = hasher.hexdigest()
+            
+            try:
+                ckpt_data = torch.load(ckpt_p, map_location="cpu")
+                epoch = ckpt_data.get("epoch")
+                global_step = ckpt_data.get("global_step")
+                callbacks_data = ckpt_data.get("callbacks", {})
+                score = None
+                for cb_type, cb_state in callbacks_data.items():
+                    if "ModelCheckpoint" in cb_type and "best_model_score" in cb_state:
+                        sc = cb_state.get("best_model_score")
+                        if sc is not None:
+                            score = sc.item() if isinstance(sc, torch.Tensor) else sc
+                            break
+            except Exception:
+                epoch, global_step, score = None, None, None
+
+            if os.path.normpath(ckpt_p) == os.path.normpath(best_path):
+                best_validation_loss = score
+
+            checkpoint_hashes.append({
+                "experiment_identifier": args.exp_name,
+                "hidden_size": cfg.teacher.hidden_size,
+                "hidden_continuous_size": getattr(cfg.teacher, "hidden_continuous_size", 8),
+                "epoch": epoch,
+                "global_step": global_step,
+                "monitored_metric": "val_loss",
+                "monitored_score": score,
+                "checkpoint_path": ckpt_p,
+                "file_size": sz,
+                "sha256_hash": sha256
+            })
+
+    best_epoch = next((ch["epoch"] for ch in checkpoint_hashes if os.path.normpath(ch["checkpoint_path"]) == os.path.normpath(best_path)), None)
+    best_step = next((ch["global_step"] for ch in checkpoint_hashes if os.path.normpath(ch["checkpoint_path"]) == os.path.normpath(best_path)), None)
+
+
     additional_fields = {
+        "experiment_identifier": args.exp_name,
         "scheduler_reduction_events": obs_callback.reduction_events,
         "total_training_duration": obs_callback.total_training_duration,
+        "checkpoint_hashes": checkpoint_hashes,
+        "best_validation_loss": best_validation_loss,
+        "best_checkpoint_path": best_path,
+        "best_checkpoint_epoch": best_epoch,
+        "best_checkpoint_global_step": best_step,
     }
     if torch.cuda.is_available():
         additional_fields["peak_gpu_memory_MB"] = torch.cuda.max_memory_allocated() / (1024 ** 2)

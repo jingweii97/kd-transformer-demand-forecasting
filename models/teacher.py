@@ -9,6 +9,8 @@ def create_tft_teacher(training_dataset, cfg):
         training_dataset,
         learning_rate=cfg.teacher.lr,
         hidden_size=cfg.teacher.hidden_size,
+        hidden_continuous_size=getattr(cfg.teacher, "hidden_continuous_size", 8),
+        lstm_layers=getattr(cfg.teacher, "lstm_layers", 1),
         attention_head_size=cfg.teacher.attention_heads,
         dropout=cfg.teacher.dropout,
         loss=QuantileLoss(),
