@@ -66,11 +66,23 @@ def load_config(env_name="local", experiment_name=None, config_dir="configs"):
     
     # Apply experiment overrides explicitly if requested
     if experiment_name:
-        exp_path = os.path.join(config_dir_abs, "experiment", f"{experiment_name}.yaml")
-        if not os.path.exists(exp_path):
-            raise FileNotFoundError(f"Experiment configuration file not found: {exp_path}")
+        candidates = [
+            os.path.join(config_dir_abs, "experiments", f"{experiment_name}.yaml"),
+            os.path.join(config_dir_abs, "experiment", f"{experiment_name}.yaml"),
+            os.path.join(config_dir_abs, "experiment", f"{experiment_name}"),
+            resolve_path(experiment_name)
+        ]
+        exp_path = None
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate) and os.path.isfile(candidate):
+                exp_path = candidate
+                break
+                
+        if not exp_path:
+            raise FileNotFoundError(f"Experiment configuration file not found for '{experiment_name}'.")
         with open(exp_path, 'r') as f:
             exp_cfg = yaml.safe_load(f) or {}
+
             
         if "store_filter" in exp_cfg:
             merged_dict["environment"]["store_filter"] = exp_cfg["store_filter"]
