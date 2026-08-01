@@ -12,6 +12,6 @@ def create_tft_teacher(training_dataset, cfg):
         attention_head_size=cfg.teacher.attention_heads,
         dropout=cfg.teacher.dropout,
         loss=QuantileLoss(),
-        reduce_on_plateau_patience=cfg.teacher.patience,
+        reduce_on_plateau_patience=getattr(cfg.teacher, "scheduler_patience", getattr(cfg.teacher, "patience", 2)),
         mask_bias=-1e4
     )

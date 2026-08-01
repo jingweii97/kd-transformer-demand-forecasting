@@ -15,7 +15,7 @@ from data.cache import resolve_stores, is_cache_valid
 from data.dataset import build_timeseries_dataset
 from models.teacher import create_tft_teacher
 import torch
-
+from scripts.observability import ObservabilityCallback
 class EpochMetricsLoggingCallback(pl.Callback):
     """
     Minimal PyTorch Lightning callback to print epoch-level metrics to stdout.
@@ -144,24 +144,29 @@ def main():
     # Set up Logger and Callbacks
     logger = get_csv_logger(cfg.environment.outputs_dir, "teacher", args.exp_name)
     
+    checkpoint_filename = getattr(cfg.teacher, "checkpoint_filename", "best_tft_teacher")
+    save_top_k = getattr(cfg.teacher, "save_top_k", 1)
+    
     checkpoint_callback = ModelCheckpoint(
         dirpath=exp_dir,
         monitor="val_loss",
-        filename="best_tft_teacher",
-        save_top_k=1,
+        filename=checkpoint_filename,
+        save_top_k=save_top_k,
         save_last=True,
         mode="min"
     )
     
+    early_stop_patience = getattr(cfg.teacher, "early_stopping_patience", cfg.teacher.patience)
     early_stop_callback = EarlyStopping(
         monitor="val_loss",
-        patience=cfg.teacher.patience,
+        patience=early_stop_patience,
         min_delta=1e-4,
         mode="min"
     )
 
     enable_progress_bar = True
-    callbacks = [early_stop_callback, checkpoint_callback]
+    obs_callback = ObservabilityCallback()
+    callbacks = [early_stop_callback, checkpoint_callback, obs_callback]
     if args.env == "kaggle":
         enable_progress_bar = False
         callbacks.append(EpochMetricsLoggingCallback())
@@ -191,7 +196,14 @@ def main():
     print(f"Training completed. Best model checkpoint saved to: {best_path}")
     
     # Save experiment metadata
-    save_metadata(exp_dir, cfg.environment.seed, checkpoint_path=best_path)
+    additional_fields = {
+        "scheduler_reduction_events": obs_callback.reduction_events,
+        "total_training_duration": obs_callback.total_training_duration,
+    }
+    if torch.cuda.is_available():
+        additional_fields["peak_gpu_memory_MB"] = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        
+    save_metadata(exp_dir, cfg.environment.seed, checkpoint_path=best_path, additional_fields=additional_fields)
 
     # Optional / Non-blocking curve plotting helper call
     try:
