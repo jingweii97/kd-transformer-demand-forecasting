@@ -12,6 +12,7 @@ from datetime import datetime
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.config import load_config
+from utils.paths import get_dataset_dir
 from data.cache import load_from_cache, load_dataset_from_cache, resolve_stores
 from models.teacher import TemporalFusionTransformer
 from scripts.evaluate_models import compute_wrmsse_weights_and_scales, HIERARCHY_LEVELS, _compute_scale
@@ -241,16 +242,23 @@ def main():
         return
         
     print("Loading datasets...")
-    stores = resolve_stores(getattr(cfg.environment, "store_filter", None))
-    df_full = load_from_cache(cfg.dataset.processed_data_path, stores)
-    df_train, df_val, df_test = load_dataset_from_cache(cfg.dataset.dataset_cache_path)
-    
-    train_end = df_train['time_idx'].max()
-    weights, scales, diag = compute_wrmsse_weights_and_scales(df_full[df_full['time_idx'] <= train_end], train_end)
-    
+    ds_dir = get_dataset_dir(cfg)
+    store_filter = getattr(cfg.environment, "store_filter", None)
+
+    # Load the full dataset (train + val) — identical pattern to evaluate_models.py
+    df = load_dataset_from_cache(artifacts_dir=ds_dir, store_filter=store_filter)
+
+    train_end = cfg.dataset.splits.train.end
+    val_end = cfg.dataset.splits.validation.end
+    df_train = df[df['time_idx'] <= train_end].copy()
+    df_val = df[(df['time_idx'] > train_end) & (df['time_idx'] <= val_end)].copy()
+
+    weights, scales, diag = compute_wrmsse_weights_and_scales(df_train, train_end)
+
     from pytorch_forecasting import TimeSeriesDataSet
-    train_ds = TimeSeriesDataSet.load(os.path.join(cfg.dataset.dataset_cache_path, "train_dataset_params.pt"))
-    val_ds = TimeSeriesDataSet.from_dataset(train_ds, df_val, predict=True, stop_randomization=True)
+    from data.dataset import build_timeseries_dataset
+    training_dataset = build_timeseries_dataset(df, cfg, is_train=True)
+    val_ds = TimeSeriesDataSet.from_dataset(training_dataset, df_val, predict=True, stop_randomization=True)
     val_dl = val_ds.to_dataloader(train=False, batch_size=cfg.teacher.batch_size, num_workers=0)
     
     results = []
