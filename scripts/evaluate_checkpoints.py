@@ -232,7 +232,10 @@ def main():
         "outputs/teacher/exp_full_phase1/best_tft_teacher.ckpt",
         "outputs/teacher/tft64_optimized/tft64-opt-epoch=epoch=03-val_loss=val_loss=0.473921.ckpt",
         "outputs/teacher/tft64_optimized/tft64-opt-epoch=epoch=05-val_loss=val_loss=0.474301.ckpt",
-        "outputs/teacher/tft64_optimized/tft64-opt-epoch=epoch=08-val_loss=val_loss=0.474549.ckpt"
+        "outputs/teacher/tft64_optimized/tft64-opt-epoch=epoch=08-val_loss=val_loss=0.474549.ckpt",
+        "outputs/teacher/tft64_huber/tft64-huber-epoch=epoch=05-val_loss=val_loss=0.606112.ckpt",
+        "outputs/teacher/tft64_huber/tft64-huber-epoch=epoch=13-val_loss=val_loss=0.606753.ckpt",
+        "outputs/teacher/tft64_huber/tft64-huber-epoch=epoch=08-val_loss=val_loss=0.612628.ckpt"
     ]
     
     valid_checkpoints = [c for c in checkpoints if os.path.exists(c)]
@@ -304,7 +307,14 @@ def main():
         metrics = authoritative_evaluation(df_preds, df_val, weights, scales)
         
         meta.update(metrics)
-        meta['teacher_version'] = "Teacher-v1" if "exp_full" in ckpt else "Teacher-v2"
+        if "exp_full" in ckpt:
+            meta['teacher_version'] = "Teacher-v1: Standard Quantile TFT"
+        elif "tft64_optimized" in ckpt:
+            meta['teacher_version'] = "Teacher-v2: Optimized Quantile TFT"
+        elif "tft64_huber" in ckpt:
+            meta['teacher_version'] = "Teacher-v3: Huber TFT"
+        else:
+            meta['teacher_version'] = "Teacher"
         results.append(meta)
         
     df_results = pd.DataFrame(results)
