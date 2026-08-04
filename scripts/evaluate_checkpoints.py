@@ -241,7 +241,7 @@ def main():
         return
         
     print("Loading datasets...")
-    stores = resolve_stores(cfg.dataset.filter_stores)
+    stores = resolve_stores(getattr(cfg.environment, "store_filter", None))
     df_full = load_from_cache(cfg.dataset.processed_data_path, stores)
     df_train, df_val, df_test = load_dataset_from_cache(cfg.dataset.dataset_cache_path)
     
