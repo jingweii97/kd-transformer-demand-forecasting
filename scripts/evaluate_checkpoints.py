@@ -89,10 +89,13 @@ def evaluate_checkpoint(ckpt_path, ds_dir, cfg, df_train, train_end,
     store_filter = getattr(cfg.environment, "store_filter", None)
     stores = resolve_stores(store_filter)
 
-    val_start = cfg.dataset.splits.train.end + 1
     val_end = cfg.dataset.splits.validation.end
     L = cfg.dataset.lookback_window
     H = cfg.dataset.prediction_window
+    
+    # In predict=True mode, TimeSeriesDataSet only emits the LAST H-day window
+    # in the dataframe. Thus, the actual validation window being evaluated is:
+    val_start = val_end - H + 1
 
     # We need training_dataset for TimeSeriesDataSet.from_dataset().
     # Load train data from cache to build it.
