@@ -1,22 +1,23 @@
 #!/bin/bash -l
-#SBATCH --partition=cpu-epyc-genoa
+#SBATCH --partition=gpu-a100
 #SBATCH --job-name=m5_audit
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
-#SBATCH --qos=normal
+#SBATCH --gpus=1
+#SBATCH --mem=128G
+#SBATCH --qos=long
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
 set -e
-EXP_NAME=${1:-"exp_full_phase1"}
-shift || true
+
+cd /home/user/yeoh97/repo
 
 module load miniconda/24.1.2 2>/dev/null || module load miniconda/3 2>/dev/null || echo "[Info] Using default system conda"
 source $(conda info --base)/etc/profile.d/conda.sh 2>/dev/null || true
-conda activate m5_env 2>/dev/null || true
+conda activate m5_env 2>/dev/null || conda activate kd_env 2>/dev/null || true
 
 mkdir -p logs
-echo "Auditing Soft Targets for experiment: $EXP_NAME with --experiment full"
-python scripts/audit_soft_targets.py --env dicc --experiment full --exp-name "$EXP_NAME" "$@"
+echo "Running Teacher-Student Comparability Audit"
+python scripts/audit_comparability.py

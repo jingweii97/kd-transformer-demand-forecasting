@@ -361,7 +361,12 @@ def main():
     with open(os.path.join(out_dir, "checkpoint_validation_report.md"), "w") as f:
         f.write("# Teacher Checkpoint Validation Report\n\n")
         f.write(f"Generated: {timestamp}\n\n")
-        f.write(df_results.to_markdown(index=False))
+        # Manually create markdown table to avoid 'tabulate' dependency
+        cols = df_results.columns.tolist()
+        f.write("| " + " | ".join(cols) + " |\n")
+        f.write("|" + "|".join(["---"] * len(cols)) + "|\n")
+        for _, row in df_results.iterrows():
+            f.write("| " + " | ".join(str(x) for x in row.values) + " |\n")
 
     print(f"\n{'='*60}")
     print(f"Results saved to: {out_dir}")
