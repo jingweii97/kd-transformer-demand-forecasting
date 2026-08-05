@@ -1,17 +1,25 @@
+"""
+evaluate_checkpoints.py — Teacher Checkpoint Validation Script
+
+Evaluates existing TFT-64 teacher checkpoints (Quantile and Huber) against the
+full validation split. Uses the authoritative compute_hierarchical_wrmsse and
+compute_mase from evaluate_models.py, with identical DataFrame construction and
+series-ordering logic.
+"""
 import os
 import sys
 import argparse
 import hashlib
 import torch
-import pandas as pd
 import numpy as np
+import pandas as pd
 from datetime import datetime
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.config import load_config
 from utils.paths import get_dataset_dir
-from data.cache import load_dataset_from_cache
+from data.cache import load_from_cache, resolve_stores
 from data.dataset import build_timeseries_dataset
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 from scripts.evaluate_models import (
@@ -19,18 +27,41 @@ from scripts.evaluate_models import (
     compute_hierarchical_wrmsse,
     compute_mase_scales,
     compute_mase,
-    HIERARCHY_LEVELS,
     FULL_M5_SERIES_COUNT,
 )
 
 
-def get_checkpoint_meta(ckpt_path):
-    """Load checkpoint and extract identity metadata without running inference."""
-    print(f"\nLoading checkpoint: {ckpt_path}")
+def get_predictions_tft(model, loader):
+    """
+    Generate point forecasts from a TFT using model.predict().
+    Matches get_predictions() in evaluate_models.py exactly.
+    Returns a numpy array [N, H].
+    """
+    preds = model.predict(
+        loader,
+        mode="prediction",
+        trainer_kwargs={
+            "accelerator": "cuda" if torch.cuda.is_available() else "cpu",
+            "devices": 1,
+        },
+    )
+    return preds.cpu().numpy()
+
+
+def evaluate_checkpoint(ckpt_path, ds_dir, cfg, df_train, train_end,
+                        weights_dict, scales_dict, mase_scales_dict, series_ids):
+    """
+    Loads one checkpoint, runs inference per-store on the validation window,
+    and returns all metrics. Mirrors the per-store loop in evaluate_models.py.
+    """
+    print(f"\n{'='*60}")
+    print(f"Checkpoint: {os.path.basename(ckpt_path)}")
+
     if not os.path.exists(ckpt_path):
-        print(f"  MISSING — skipping.")
+        print("  MISSING — skipping.")
         return None
 
+    # ── Checkpoint metadata ──────────────────────────────────────────────────
     with open(ckpt_path, "rb") as f:
         sha256 = hashlib.sha256(f.read()).hexdigest()
     ckpt_size = os.path.getsize(ckpt_path)
@@ -40,177 +71,192 @@ def get_checkpoint_meta(ckpt_path):
             ckpt_path, map_location="cpu"
         )
     except Exception as e:
-        print(f"  Failed to load: {e}")
+        print(f"  Failed to load checkpoint: {e}")
         return None
 
     model.eval()
-
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
     is_quantile = hasattr(model.loss, "quantiles")
     objective = "Quantile" if is_quantile else "Huber"
+    internal_epoch = model.current_epoch
+    global_step = model.global_step
+    hidden_size = getattr(model.hparams, "hidden_size", None)
 
-    if is_quantile:
-        quantiles = list(model.loss.quantiles)
-        assert 0.5 in quantiles, f"0.5 not in quantiles: {quantiles}"
-        q50_idx = quantiles.index(0.5)
-    else:
-        quantiles = None
-        q50_idx = 0
+    # ── Build training dataset for TimeSeriesDataSet ─────────────────────────
+    # We load one small slice per store to build a combined training dataset.
+    # This follows the same logic as evaluate_models.py which loads df and
+    # passes it to build_timeseries_dataset once.
+    store_filter = getattr(cfg.environment, "store_filter", None)
+    stores = resolve_stores(store_filter)
+
+    val_start = cfg.dataset.splits.train.end + 1
+    val_end = cfg.dataset.splits.validation.end
+    L = cfg.dataset.lookback_window
+    H = cfg.dataset.prediction_window
+
+    # We need training_dataset for TimeSeriesDataSet.from_dataset().
+    # Load train data from cache to build it.
+    print("  Building training dataset schema...")
+    train_dfs = []
+    for store in stores:
+        df_s = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
+        if df_s is not None:
+            train_dfs.append(df_s[df_s["time_idx"] <= train_end])
+    df_train_full = pd.concat(train_dfs, ignore_index=True)
+    del train_dfs
+    for col in ["id", "item_id", "dept_id", "cat_id", "store_id", "state_id",
+                "weekday", "month", "year", "event_name_1", "event_type_1"]:
+        if col in df_train_full.columns:
+            df_train_full[col] = df_train_full[col].astype(str).astype("category")
+
+    training_dataset = build_timeseries_dataset(df_train_full, cfg, is_train=True)
+    del df_train_full
+
+    # ── Per-store validation inference ───────────────────────────────────────
+    # Exactly mirrors evaluate_models.py: load each store's slice separately,
+    # build a per-store dataset, run inference, collect predictions + decoded_index.
+    print("  Running per-store validation inference...")
+    min_idx = val_start - L
+    all_actuals = []
+    all_preds = []
+    all_decoded = []
+
+    for store in stores:
+        df_part = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
+        if df_part is None:
+            continue
+
+        df_part_sliced = df_part[
+            (df_part["time_idx"] >= min_idx) & (df_part["time_idx"] <= val_end)
+        ].copy()
+        del df_part
+
+        for col in ["id", "item_id", "dept_id", "cat_id", "store_id", "state_id",
+                    "weekday", "month", "year", "event_name_1", "event_type_1"]:
+            if col in df_part_sliced.columns:
+                df_part_sliced[col] = df_part_sliced[col].astype(str).astype("category")
+
+        if len(df_part_sliced) == 0:
+            continue
+
+        part_ds = TimeSeriesDataSet.from_dataset(
+            training_dataset, df_part_sliced, predict=True, stop_randomization=True
+        )
+
+        # Alignment guard — mirrors evaluate_models.py lines 1094-1096
+        _decoded = part_ds.decoded_index
+        assert _decoded["time_idx_first_prediction"].nunique() == 1, (
+            "Multiple prediction starts in one store partition"
+        )
+        assert int(_decoded["time_idx_first_prediction"].iloc[0]) == val_start, (
+            f"Prediction start mismatch: expected {val_start}, "
+            f"got {_decoded['time_idx_first_prediction'].iloc[0]}"
+        )
+        assert _decoded["id"].is_unique, "Duplicate series IDs in store partition"
+
+        part_loader = part_ds.to_dataloader(
+            train=False,
+            batch_size=cfg.teacher.batch_size,
+            shuffle=False,
+            num_workers=getattr(cfg.environment, "num_workers", 0),
+        )
+
+        # Collect actuals from batches
+        store_actuals = []
+        for batch_x, batch_y in part_loader:
+            target = batch_y[0] if isinstance(batch_y, (tuple, list)) else batch_y
+            store_actuals.append(target.cpu().numpy())
+        actuals_np = np.concatenate(store_actuals, axis=0)  # [n_series, H]
+
+        # Run inference
+        store_preds = get_predictions_tft(model, part_loader)  # [n_series, H]
+
+        assert store_preds.shape == actuals_np.shape, (
+            f"Shape mismatch: preds={store_preds.shape}, actuals={actuals_np.shape}"
+        )
+
+        all_actuals.append(actuals_np)
+        all_preds.append(store_preds)
+        all_decoded.append(_decoded)
+        del df_part_sliced, part_ds, part_loader
+
+    if not all_actuals:
+        print("  No data collected — skipping.")
+        return None
+
+    # ── Sort by id — identical to evaluate_models.py lines 1136-1147 ─────────
+    concatenated_decoded = pd.concat(all_decoded, ignore_index=True)
+    concatenated_decoded["id"] = concatenated_decoded["id"].astype(str)
+    order = (
+        concatenated_decoded
+        .assign(row_idx=np.arange(len(concatenated_decoded)))
+        .sort_values("id")["row_idx"]
+        .to_numpy()
+    )
+    actuals = np.concatenate(all_actuals, axis=0)[order]        # [N, H]
+    forecasts = np.concatenate(all_preds, axis=0)[order]        # [N, H]
+    sorted_ids = concatenated_decoded.sort_values("id")["id"].to_numpy()
+
+    print(f"  Series count: {actuals.shape[0]} (expected {FULL_M5_SERIES_COUNT})")
+    assert actuals.shape[0] == FULL_M5_SERIES_COUNT, (
+        f"Expected {FULL_M5_SERIES_COUNT} series, got {actuals.shape[0]}"
+    )
+    assert np.isfinite(actuals).all(), "Non-finite actuals"
+    assert np.isfinite(forecasts).all(), "Non-finite forecasts"
+
+    # ── Build gt/pred DataFrames — mirrors evaluate_models.py lines 1180-1182 ─
+    # Load the actual validation ground-truth for hierarchical grouping columns.
+    print("  Loading validation ground-truth for hierarchy columns...")
+    val_gt_dfs = []
+    for store in stores:
+        df_s = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
+        if df_s is not None:
+            val_gt_dfs.append(
+                df_s[(df_s["time_idx"] >= val_start) & (df_s["time_idx"] <= val_end)]
+            )
+    df_val_gt = pd.concat(val_gt_dfs, ignore_index=True)
+    del val_gt_dfs
+    df_val_gt["id"] = df_val_gt["id"].astype(str)
+    df_val_gt = df_val_gt.sort_values(["id", "time_idx"]).reset_index(drop=True)
+
+    # Build predictions DataFrame: copy gt (for hierarchy columns), replace sales
+    df_preds_df = df_val_gt.copy()
+    df_preds_df["sales"] = forecasts.flatten()
+
+    # ── Compute authoritative WRMSSE ─────────────────────────────────────────
+    wrmsse, level_wrmsses = compute_hierarchical_wrmsse(
+        df_val_gt, df_preds_df, weights_dict, scales_dict
+    )
+
+    # ── Point metrics ────────────────────────────────────────────────────────
+    actuals_flat = actuals.flatten()
+    preds_flat = forecasts.flatten()
+    mae  = float(np.mean(np.abs(actuals_flat - preds_flat)))
+    rmse = float(np.sqrt(np.mean((actuals_flat - preds_flat) ** 2)))
+    total_actual = float(np.sum(actuals_flat))
+    total_pred   = float(np.sum(preds_flat))
+    wape = float(np.sum(np.abs(actuals_flat - preds_flat)) / (total_actual + 1e-9))
+    agg_bias = float((total_pred / (total_actual + 1e-9)) - 1.0)
+
+    # ── Seasonal MASE — uses compute_mase() exactly as in evaluate_models.py ─
+    scales_array = np.array([
+        mase_scales_dict.get(sid, 1.0) for sid in sorted_ids
+    ])
+    mase = float(compute_mase(actuals, forecasts, scales_array))
+
+    # ── Cleanup ──────────────────────────────────────────────────────────────
+    del model
+    torch.cuda.empty_cache()
 
     return {
         "checkpoint": os.path.basename(ckpt_path),
-        "path": ckpt_path,
-        "internal_epoch": model.current_epoch,
-        "global_step": model.global_step,
+        "internal_epoch": internal_epoch,
+        "global_step": global_step,
+        "hidden_size": hidden_size,
         "objective": objective,
         "parameter_count": total_params,
-        "trainable_parameter_count": trainable_params,
-        "checkpoint_size": ckpt_size,
+        "checkpoint_size_bytes": ckpt_size,
         "checkpoint_SHA256": sha256,
-        "quantiles": quantiles,
-        "q50_idx": q50_idx,
-        "is_quantile": is_quantile,
-        "model": model,
-    }
-
-
-def run_inference(model, val_dl, meta, device):
-    """
-    Runs authoritative inference using model.predict() with trainer_kwargs,
-    exactly matching the get_predictions() pattern in evaluate_models.py.
-    Returns (preds_q50_numpy [N, H], quantile_loss_or_None).
-    """
-    trainer_kwargs = {
-        "accelerator": "cuda" if torch.cuda.is_available() else "cpu",
-        "devices": 1,
-    }
-
-    if meta["is_quantile"]:
-        # Without return_y=True, model.predict() returns a plain tensor [N, H, Q]
-        preds_full = model.predict(
-            val_dl,
-            mode="quantiles",
-            trainer_kwargs=trainer_kwargs,
-        )
-        # preds_full is a tensor [N, H, Q]
-        preds_q50 = preds_full[:, :, meta["q50_idx"]].cpu().numpy()
-
-        # Quantile loss is not computed here — it is already logged per-epoch in
-        # metrics.csv. Omitting it avoids the PredictionResults named-tuple bug.
-        quantile_loss = None
-    else:
-        preds_full = model.predict(
-            val_dl,
-            mode="prediction",
-            trainer_kwargs=trainer_kwargs,
-        )
-        # preds_full is [N, H] or [N, H, 1]
-        preds_q50 = preds_full.cpu().numpy()
-        if preds_q50.ndim == 3 and preds_q50.shape[-1] == 1:
-            preds_q50 = preds_q50.squeeze(-1)
-        quantile_loss = None
-
-    return preds_q50, quantile_loss
-
-
-def build_prediction_df(preds_q50, val_ds):
-    """
-    Reconstructs a long-format DataFrame of (id, time_idx, pred_q50)
-    from the stacked prediction array, using val_ds.decoded_index for alignment.
-    Uses the same alignment approach as the authoritative evaluator.
-    """
-    decoded = val_ds.decoded_index
-    N, H = preds_q50.shape
-    assert len(decoded) == N, (
-        f"decoded_index length {len(decoded)} != prediction rows {N}"
-    )
-
-    rows = []
-    for b in range(N):
-        sid = str(decoded.iloc[b]["id"])
-        # encoder_length is the number of encoder steps; the first decoder step
-        # starts at encoder_length time steps after the sample's start.
-        # time_idx at decoder step h is the time_idx of the first decoder position + h.
-        # val_ds.decoded_index has the 'time_idx' of the LAST encoder step.
-        last_encoder_tidx = int(decoded.iloc[b]["time_idx"])
-        for h in range(H):
-            t_idx = last_encoder_tidx + 1 + h
-            rows.append({
-                "id": sid,
-                "time_idx": t_idx,
-                "pred_q50": float(preds_q50[b, h]),
-            })
-
-    return pd.DataFrame(rows)
-
-
-def evaluate_predictions(df_preds, df_val, df_train, weights_dict, scales_dict,
-                         mase_scales_dict, series_ids):
-    """
-    Computes all required validation metrics using the authoritative
-    compute_hierarchical_wrmsse from evaluate_models.py.
-    """
-    print("  Running authoritative metric computation...")
-
-    # Merge predictions with validation actuals
-    df_val_str = df_val.copy()
-    df_val_str["id"] = df_val_str["id"].astype(str)
-
-    df_merged = df_val_str.merge(df_preds, on=["id", "time_idx"], how="inner")
-    print(f"  Merged rows: {len(df_merged)} (predictions: {len(df_preds)})")
-
-    if len(df_merged) == 0:
-        print("  ERROR: No rows matched after merge — check id/time_idx alignment.")
-        return None
-
-    # Build gt and preds DataFrames in the format expected by compute_hierarchical_wrmsse
-    # (which expects 'sales' column for both)
-    df_gt = df_merged[["id", "time_idx", "state_id", "store_id", "cat_id",
-                         "dept_id", "item_id", "sales"]].copy()
-    df_pred = df_merged[["id", "time_idx", "state_id", "store_id", "cat_id",
-                           "dept_id", "item_id"]].copy()
-    df_pred["sales"] = df_merged["pred_q50"].values
-
-    # WRMSSE (authoritative)
-    wrmsse, level_wrmsses = compute_hierarchical_wrmsse(df_gt, df_pred, weights_dict, scales_dict)
-
-    # Point metrics
-    actuals = df_merged["sales"].values
-    preds   = df_merged["pred_q50"].values
-
-    mae  = float(np.mean(np.abs(actuals - preds)))
-    rmse = float(np.sqrt(np.mean((actuals - preds) ** 2)))
-
-    total_actual = float(np.sum(actuals))
-    total_pred   = float(np.sum(preds))
-    wape = float(np.sum(np.abs(actuals - preds)) / (total_actual + 1e-9))
-    agg_bias = float((total_pred / (total_actual + 1e-9)) - 1.0)
-
-    # Seasonal MASE — series-level, aligned to series_ids order
-    # Reshape merged into [num_series, horizon] arrays
-    df_grouped_act  = df_merged.groupby("id")["sales"].apply(np.array)
-    df_grouped_pred = df_merged.groupby("id")["pred_q50"].apply(np.array)
-
-    # Only compute MASE for series that have matching scale
-    mase_vals = []
-    for sid in df_grouped_act.index:
-        sid_str = str(sid)
-        if sid_str not in mase_scales_dict:
-            continue
-        scale = mase_scales_dict[sid_str]
-        if scale <= 0:
-            continue
-        a = df_grouped_act[sid]
-        p = df_grouped_pred[sid]
-        if len(a) != len(p) or len(a) == 0:
-            continue
-        mase_vals.append(float(np.mean(np.abs(a - p)) / scale))
-
-    mase = float(np.mean(mase_vals)) if mase_vals else float("nan")
-
-    return {
         "validation_WRMSSE": wrmsse,
         "validation_MAE": mae,
         "validation_RMSE": rmse,
@@ -230,112 +276,75 @@ def main():
     cfg = load_config(args.env)
 
     checkpoints = [
-        "outputs/teacher/exp_full_phase1/best_tft_teacher.ckpt",
-        "outputs/teacher/tft64_optimized/tft64-opt-epoch=epoch=03-val_loss=val_loss=0.473921.ckpt",
-        "outputs/teacher/tft64_optimized/tft64-opt-epoch=epoch=05-val_loss=val_loss=0.474301.ckpt",
-        "outputs/teacher/tft64_optimized/tft64-opt-epoch=epoch=08-val_loss=val_loss=0.474549.ckpt",
-        "outputs/teacher/tft64_huber/tft64-huber-epoch=epoch=05-val_loss=val_loss=0.606112.ckpt",
-        "outputs/teacher/tft64_huber/tft64-huber-epoch=epoch=13-val_loss=val_loss=0.606753.ckpt",
-        "outputs/teacher/tft64_huber/tft64-huber-epoch=epoch=08-val_loss=val_loss=0.612628.ckpt",
+        ("Teacher-v1: Original Quantile",
+         "outputs/teacher/exp_full_phase1/best_tft_teacher.ckpt"),
+        ("Teacher-v2: Optimized Quantile (Epoch 3)",
+         "outputs/teacher/tft64_optimized/tft64-opt-epoch=epoch=03-val_loss=val_loss=0.473921.ckpt"),
+        ("Teacher-v2: Optimized Quantile (Epoch 5)",
+         "outputs/teacher/tft64_optimized/tft64-opt-epoch=epoch=05-val_loss=val_loss=0.474301.ckpt"),
+        ("Teacher-v2: Optimized Quantile (Epoch 8)",
+         "outputs/teacher/tft64_optimized/tft64-opt-epoch=epoch=08-val_loss=val_loss=0.474549.ckpt"),
+        ("Teacher-v3: Huber (Epoch 5 - best val_loss)",
+         "outputs/teacher/tft64_huber/tft64-huber-epoch=epoch=05-val_loss=val_loss=0.606112.ckpt"),
+        ("Teacher-v3: Huber (Epoch 13 - best MAE)",
+         "outputs/teacher/tft64_huber/tft64-huber-epoch=epoch=13-val_loss=val_loss=0.606753.ckpt"),
+        ("Teacher-v3: Huber (Epoch 8)",
+         "outputs/teacher/tft64_huber/tft64-huber-epoch=epoch=08-val_loss=val_loss=0.612628.ckpt"),
     ]
 
-    valid_checkpoints = [c for c in checkpoints if os.path.exists(c)]
-    missing = [c for c in checkpoints if not os.path.exists(c)]
-    if missing:
-        for m in missing:
-            print(f"MISSING checkpoint (will skip): {m}")
+    print("\nCheckpoint existence check:")
+    for label, path in checkpoints:
+        status = "OK" if os.path.exists(path) else "MISSING"
+        print(f"  [{status}] {label}")
+
+    valid_checkpoints = [(label, path) for label, path in checkpoints if os.path.exists(path)]
     if not valid_checkpoints:
         print("No valid checkpoints found — aborting.")
         return
 
-    # ── Data loading — identical pattern to evaluate_models.py ──
-    print("\nLoading dataset...")
+    # ── Pre-load shared data: train split for WRMSSE/MASE scales ─────────────
+    print("\nLoading training data for scale computation...")
     ds_dir       = get_dataset_dir(cfg)
     store_filter = getattr(cfg.environment, "store_filter", None)
-    df           = load_dataset_from_cache(artifacts_dir=ds_dir, store_filter=store_filter)
+    stores       = resolve_stores(store_filter)
+    train_end    = cfg.dataset.splits.train.end
 
-    train_end = cfg.dataset.splits.train.end
-    val_end   = cfg.dataset.splits.validation.end
-    df_train  = df[df["time_idx"] <= train_end].copy()
-    df_val    = df[(df["time_idx"] > train_end) & (df["time_idx"] <= val_end)].copy()
+    train_dfs = []
+    for store in stores:
+        df_s = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
+        if df_s is not None:
+            train_dfs.append(df_s[df_s["time_idx"] <= train_end])
+    df_train = pd.concat(train_dfs, ignore_index=True)
+    del train_dfs
+    print(f"  Train rows: {len(df_train):,}")
 
-    print(f"  Train rows: {len(df_train):,} | Val rows: {len(df_val):,}")
-
-    # ── Pre-compute WRMSSE scales/weights and MASE scales ──
     weights_dict, scales_dict, scale_diag = compute_wrmsse_weights_and_scales(df_train, train_end)
     mase_scales_dict = compute_mase_scales(df_train, train_end)
-    series_ids = df["id"].astype(str).drop_duplicates().sort_values().to_numpy()
+    series_ids = df_train["id"].astype(str).drop_duplicates().sort_values().to_numpy()
+    del df_train
 
-    # ── Build TimeSeriesDataSet for validation ──
-    print("\nBuilding validation dataset...")
-    training_dataset = build_timeseries_dataset(df, cfg, is_train=True)
-    val_ds = TimeSeriesDataSet.from_dataset(
-        training_dataset, df_val, predict=True, stop_randomization=True
-    )
-    val_dl = val_ds.to_dataloader(
-        train=False,
-        batch_size=cfg.teacher.batch_size,
-        num_workers=getattr(cfg.environment, "num_workers", 0),
-        shuffle=False,
-    )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    # ── Evaluate each checkpoint ──────────────────────────────────────────────
     results = []
-    for ckpt_path in valid_checkpoints:
-        meta = get_checkpoint_meta(ckpt_path)
-        if meta is None:
-            continue
-
-        model = meta.pop("model").to(device)
-
-        print(f"  Running inference for: {meta['checkpoint']}")
-        preds_q50, quantile_loss = run_inference(model, val_dl, meta, device)
-
-        print(f"  Prediction shape: {preds_q50.shape}")
-
-        df_preds = build_prediction_df(preds_q50, val_ds)
-
-        metrics = evaluate_predictions(
-            df_preds, df_val, df_train,
-            weights_dict, scales_dict,
-            mase_scales_dict, series_ids,
+    for label, ckpt_path in valid_checkpoints:
+        result = evaluate_checkpoint(
+            ckpt_path, ds_dir, cfg, None, train_end,
+            weights_dict, scales_dict, mase_scales_dict, series_ids,
         )
-        if metrics is None:
-            print(f"  Evaluation failed for {meta['checkpoint']} — skipping.")
-            continue
-
-        meta["validation_quantile_loss"] = quantile_loss
-        meta.update(metrics)
-
-        if "exp_full" in ckpt_path:
-            meta["teacher_version"] = "Teacher-v1: Standard Quantile TFT"
-        elif "tft64_optimized" in ckpt_path:
-            meta["teacher_version"] = "Teacher-v2: Optimized Quantile TFT"
-        elif "tft64_huber" in ckpt_path:
-            meta["teacher_version"] = "Teacher-v3: Huber TFT"
-        else:
-            meta["teacher_version"] = "Teacher"
-
-        results.append(meta)
-        print(f"  Done. WRMSSE={metrics['validation_WRMSSE']:.5f}  MAE={metrics['validation_MAE']:.5f}")
-
-        # Free model memory before loading the next checkpoint
-        del model
-        torch.cuda.empty_cache()
+        if result is not None:
+            result["teacher_version"] = label
+            results.append(result)
 
     if not results:
         print("No results produced — exiting.")
         return
 
+    # ── Output ────────────────────────────────────────────────────────────────
     df_results = pd.DataFrame(results)
-
     columns = [
         "teacher_version", "checkpoint", "internal_epoch", "global_step",
-        "objective", "parameter_count", "trainable_parameter_count",
-        "checkpoint_size", "validation_quantile_loss",
-        "validation_MAE", "validation_RMSE", "validation_seasonal_MASE",
-        "validation_WAPE", "validation_WRMSSE", "aggregate_percentage_bias",
+        "hidden_size", "objective", "parameter_count", "checkpoint_size_bytes",
+        "validation_WRMSSE", "validation_MAE", "validation_RMSE",
+        "validation_WAPE", "validation_seasonal_MASE", "aggregate_percentage_bias",
         "actual_total", "predicted_total", "checkpoint_SHA256",
     ]
     df_results = df_results[[c for c in columns if c in df_results.columns]]
@@ -344,19 +353,17 @@ def main():
     out_dir   = f"artifacts/teacher_checkpoint_validation_{timestamp}"
     os.makedirs(out_dir, exist_ok=True)
 
-    csv_path = os.path.join(out_dir, "checkpoint_metrics.csv")
-    md_path  = os.path.join(out_dir, "checkpoint_validation_report.md")
+    df_results.to_csv(os.path.join(out_dir, "checkpoint_metrics.csv"), index=False)
 
-    df_results.to_csv(csv_path, index=False)
-
-    with open(md_path, "w") as f:
-        f.write("# Checkpoint Validation Report\n\n")
+    with open(os.path.join(out_dir, "checkpoint_validation_report.md"), "w") as f:
+        f.write("# Teacher Checkpoint Validation Report\n\n")
         f.write(f"Generated: {timestamp}\n\n")
         f.write(df_results.to_markdown(index=False))
 
-    print(f"\nResults saved to: {out_dir}")
-    print(df_results[["teacher_version", "checkpoint", "validation_WRMSSE",
-                       "validation_MAE", "validation_RMSE"]].to_string(index=False))
+    print(f"\n{'='*60}")
+    print(f"Results saved to: {out_dir}")
+    print(df_results[["teacher_version", "validation_WRMSSE", "validation_MAE",
+                       "validation_RMSE", "validation_seasonal_MASE"]].to_string(index=False))
 
 
 if __name__ == "__main__":
