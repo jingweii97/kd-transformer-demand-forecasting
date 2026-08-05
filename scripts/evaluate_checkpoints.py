@@ -88,20 +88,17 @@ def run_inference(model, val_dl, meta, device):
     }
 
     if meta["is_quantile"]:
-        # Return full quantile tensor for loss calculation
+        # Without return_y=True, model.predict() returns a plain tensor [N, H, Q]
         preds_full = model.predict(
             val_dl,
             mode="quantiles",
-            return_y=True,
             trainer_kwargs=trainer_kwargs,
         )
         # preds_full is a tensor [N, H, Q]
         preds_q50 = preds_full[:, :, meta["q50_idx"]].cpu().numpy()
 
-        # Quantile loss: use model.predict with mode="raw" to get targets, or
-        # skip and set None — the key metrics are WRMSSE/MAE/RMSE, not raw Q-loss.
-        # We leave quantile_loss as None here to avoid triggering predictions.y bugs;
-        # the correct loss is already logged per-epoch in metrics.csv.
+        # Quantile loss is not computed here — it is already logged per-epoch in
+        # metrics.csv. Omitting it avoids the PredictionResults named-tuple bug.
         quantile_loss = None
     else:
         preds_full = model.predict(
