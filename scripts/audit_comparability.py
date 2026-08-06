@@ -15,15 +15,16 @@ from utils.config import load_config
 from utils.paths import resolve_path, get_dataset_dir
 from data.cache import load_from_cache, resolve_stores
 from data.dataset import build_timeseries_dataset
-from pytorch_forecasting import TimeSeriesDataSet
-from models.teacher import M5TemporalFusionTransformer
+from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
 from models.student import M5TransformerStudent
+from models.losses import HuberLossMetric
 from scripts.evaluate_models import (
     compute_wrmsse_weights_and_scales,
     compute_hierarchical_wrmsse,
     compute_mase_scales,
     compute_mase
 )
+import argparse
 
 def print_memory(label):
     rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -65,6 +66,11 @@ def smoke_test(model_name, model, val_dl, device):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env", type=str, default="dicc")
+    parser.add_argument("--experiment", type=str, default="full")
+    args = parser.parse_args()
+
     start_time = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Starting audit on device: {device}")
@@ -73,7 +79,7 @@ def main():
     out_dir = resolve_path(f"artifacts/teacher_student_comparability_{timestamp}")
     os.makedirs(out_dir, exist_ok=True)
     
-    cfg = load_config(experiment="full")
+    cfg = load_config(env_name=args.env, experiment_name=args.experiment)
     ds_dir = get_dataset_dir(cfg)
     
     stores = resolve_stores(getattr(cfg.environment, "store_filter", None))
@@ -155,8 +161,8 @@ def main():
     
     models_to_evaluate = {
         "Student (No KD)": (M5TransformerStudent, student_ckpt),
-        "Teacher (Quantile)": (M5TemporalFusionTransformer, teacher_opt_ckpt),
-        "Teacher (Huber)": (M5TemporalFusionTransformer, teacher_hub_ckpt)
+        "Teacher (Quantile)": (TemporalFusionTransformer, teacher_opt_ckpt),
+        "Teacher (Huber)": (TemporalFusionTransformer, teacher_hub_ckpt)
     }
     
     print("Loading models and performing smoke tests...")
@@ -303,58 +309,102 @@ def main():
     
     # ------------------------------------------------------------------
     # AUTHORITATIVE METRICS CALCULATION
+    # compute_wrmsse_weights_and_scales(df_train, train_end) -> weights, scales, scale_diag
+    # compute_mase_scales(df_train, train_end) -> dict {series_id: scale}
+    # compute_mase(actuals_2d, forecasts_2d, scales_1d_array) -> float
+    # compute_hierarchical_wrmsse(df_gt, df_pred, weights, scales) -> (wrmsse, level_wrmsses)
     # ------------------------------------------------------------------
     print("\nCalculating authoritative WRMSSE and MASE...")
-    print("Loading weights and scales...")
-    weights_dict, scales_dict = compute_wrmsse_weights_and_scales(ds_dir, train_end)
-    mase_scales_dict = compute_mase_scales(ds_dir, train_end)
-    
+    print("Loading weights and scales from training data...")
+
+    # Build df_train_for_metrics: training rows only, needed by weight/scale functions
+    train_dfs_metrics = []
+    for store in stores:
+        df_s = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
+        if df_s is not None:
+            train_dfs_metrics.append(df_s[df_s["time_idx"] <= train_end])
+    df_train_for_metrics = pd.concat(train_dfs_metrics, ignore_index=True)
+    del train_dfs_metrics
+    print_memory("df_train_for_metrics")
+
+    weights_dict, scales_dict, scale_diag = compute_wrmsse_weights_and_scales(df_train_for_metrics, train_end)
+    mase_scales_dict = compute_mase_scales(df_train_for_metrics, train_end)
+    del df_train_for_metrics
+
+    # Build series_ids in the same sorted order as evaluate_models.py uses
+    series_ids = df_val_full["id"].astype(str).drop_duplicates().sort_values().to_numpy()
+    assert len(series_ids) == expected_series_count, f"Series count mismatch after reload: {len(series_ids)}"
+    missing_mase = [sid for sid in series_ids if sid not in mase_scales_dict]
+    assert not missing_mase, f"Missing MASE scales for {len(missing_mase)} series"
+    scales_array = np.array([mase_scales_dict[sid] for sid in series_ids])  # shape (N,)
+
     df_val_gt = df_val_full[(df_val_full["time_idx"] >= val_start) & (df_val_full["time_idx"] <= val_end)].copy()
-    
+    df_val_gt["id"] = df_val_gt["id"].astype(str)
+    df_val_gt = df_val_gt.sort_values(["id", "time_idx"]).reset_index(drop=True)
+
     metrics_records = []
     for m in model_names:
-        df_m = df_all_preds[df_all_preds['model'] == m]
-        
+        df_m = df_all_preds[df_all_preds['model'] == m].copy()
+        df_m["series_id"] = df_m["series_id"].astype(str)
+
         pred_for_merge = df_m.rename(
             columns={
                 "series_id": "id",
                 "decoder_time_idx_or_date": "time_idx",
             }
         )[["id", "time_idx", "prediction"]]
-        
+
         assert pred_for_merge.duplicated(["id", "time_idx"]).sum() == 0, "Duplicates in prediction merge"
-        
+
         df_preds_wrmsse = df_val_gt.merge(
             pred_for_merge,
             on=["id", "time_idx"],
             how="left",
             validate="one_to_one"
         )
-        
+
         assert df_preds_wrmsse["prediction"].notna().all(), "Merge failed: missing predictions"
         assert len(df_preds_wrmsse) == len(df_val_gt), "Merge failed: row count mismatch"
-        
-        df_preds_wrmsse = df_preds_wrmsse.drop(columns=["sales"], errors="ignore").rename(columns={"prediction": "sales"})
-        
+
+        df_preds_for_wrmsse = df_preds_wrmsse.drop(columns=["sales"], errors="ignore").rename(columns={"prediction": "sales"})
+
         sort_cols = ["id", "time_idx"]
         df_val_metric = df_val_gt.sort_values(sort_cols).reset_index(drop=True)
-        df_pred_metric = df_preds_wrmsse.sort_values(sort_cols).reset_index(drop=True)
+        df_pred_metric = df_preds_for_wrmsse.sort_values(sort_cols).reset_index(drop=True)
         assert df_val_metric[sort_cols].equals(df_pred_metric[sort_cols]), "Ground-truth and prediction metric rows are misaligned"
-        
-        wrmsse = compute_hierarchical_wrmsse(df_val_metric, df_pred_metric, weights_dict, scales_dict)
-        mase = compute_mase(df_val_metric, df_pred_metric, mase_scales_dict)
-        
+
+        wrmsse_result, _ = compute_hierarchical_wrmsse(df_val_metric, df_pred_metric, weights_dict, scales_dict)
+
+        # Build 2D numpy arrays (num_series x H) in series_ids order for MASE
+        actuals_wide = (
+            df_val_gt.pivot(index="id", columns="time_idx", values="sales")
+            .reindex(series_ids)
+            .values
+        )  # shape (N, H)
+        preds_wide = (
+            df_preds_for_wrmsse.pivot(index="id", columns="time_idx", values="sales")
+            .reindex(series_ids)
+            .values
+        )  # shape (N, H)
+        assert actuals_wide.shape == (len(series_ids), H), f"actuals_wide shape mismatch: {actuals_wide.shape}"
+        assert preds_wide.shape == actuals_wide.shape, f"preds_wide shape mismatch: {preds_wide.shape}"
+        assert np.isfinite(actuals_wide).all(), "Non-finite actuals in MASE input"
+        assert np.isfinite(preds_wide).all(), "Non-finite predictions in MASE input"
+
+        mase = compute_mase(actuals_wide, preds_wide, scales_array)
+
         sum_abs_err = np.abs(df_m['prediction'] - df_m['actual']).sum()
         sum_actual = df_m['actual'].sum()
         wape = sum_abs_err / sum_actual
         bias = (df_m['prediction'].sum() - df_m['actual'].sum()) / sum_actual
         mae = np.mean(np.abs(df_m['prediction'] - df_m['actual']))
         rmse = np.sqrt(np.mean((df_m['prediction'] - df_m['actual'])**2))
-        
+
         metrics_records.append({
-            "model": m, "WRMSSE": wrmsse, "MAE": mae, "RMSE": rmse, "WAPE": wape, "MASE": mase, "Bias": bias
+            "model": m, "WRMSSE": float(wrmsse_result), "MAE": float(mae), "RMSE": float(rmse),
+            "WAPE": float(wape), "MASE": float(mase), "Bias": float(bias)
         })
-        
+
     df_metrics = pd.DataFrame(metrics_records)
     df_metrics.to_csv(os.path.join(out_dir, "common_validation_metrics.csv"), index=False)
     
