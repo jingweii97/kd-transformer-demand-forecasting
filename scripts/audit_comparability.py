@@ -1,14 +1,13 @@
 import os
 import sys
-import glob
 import time
 import json
-import resource
+import gc
+import argparse
 import torch
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from tqdm import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from utils.config import load_config
@@ -17,30 +16,37 @@ from data.cache import load_from_cache, resolve_stores
 from data.dataset import build_timeseries_dataset
 from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
 from models.student import M5TransformerStudent
-from models.losses import HuberLossMetric
 from scripts.evaluate_models import (
     compute_wrmsse_weights_and_scales,
     compute_hierarchical_wrmsse,
     compute_mase_scales,
-    compute_mase
+    compute_mase,
+    get_predictions,
 )
-import argparse
+
+try:
+    import resource
+except ImportError:
+    resource = None
 
 def print_memory(label):
-    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    print(f"[MEMORY] {label}: {rss_kb / 1024 / 1024:.2f} GB")
+    if resource is not None:
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        print(f"[MEMORY] {label}: {rss_kb / 1024 / 1024:.2f} GB")
+    else:
+        print(f"[MEMORY] {label}: (cross-platform)")
 
 def format_report_bool(cond):
     if cond is None:
         return "UNRESOLVED"
     return "Yes" if cond else "No"
 
-def smoke_test(model_name, model, val_dl, device):
+def smoke_test(model_name, model, sample_dl, device):
     print(f"\n--- Smoke Test: {model_name} ---")
-    batch = next(iter(val_dl))
+    batch = next(iter(sample_dl))
     x, y = batch
     x_dev = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in x.items()}
-    actual = y[0]
+    actual = y[0] if isinstance(y, (tuple, list)) else y
     
     with torch.no_grad():
         out = model(x_dev)
@@ -57,12 +63,29 @@ def smoke_test(model_name, model, val_dl, device):
     assert preds.shape == actual.shape, f"Shape mismatch: preds {preds.shape} != target {actual.shape}"
     assert torch.isfinite(preds).all(), "Non-finite predictions in smoke test!"
     assert torch.isfinite(actual).all(), "Non-finite actuals in smoke test!"
-    
-    _decoded = val_dl.dataset.x_to_index(x)
-    print(f"  Decoded key sample: Series {_decoded.iloc[0]['id']} Store {_decoded.iloc[0].get('store_id', 'UNKNOWN')}")
-    print(f"  Actual (first 5): {actual[0, :5].cpu().numpy()}")
-    print(f"  Preds  (first 5): {preds[0, :5].cpu().numpy()}")
     print("---------------------------------")
+
+
+def audit_store_target_alignment(df_part, decoded, origin, H, actuals, store):
+    audit_positions = [0, len(decoded) // 2, len(decoded) - 1]
+    for pos in audit_positions:
+        sid = str(decoded.iloc[pos]["id"])
+        raw_target = (
+            df_part[
+                (df_part["id"].astype(str) == sid)
+                & (df_part["time_idx"].between(origin, origin + H - 1))
+            ]
+            .sort_values("time_idx")["sales"]
+            .values
+        )
+        batch_target = actuals[pos]
+        assert raw_target.shape == batch_target.shape, (
+            f"Alignment audit shape mismatch for store={store}, id={sid}: "
+            f"raw={raw_target.shape}, batch={batch_target.shape}"
+        )
+        assert np.allclose(raw_target, batch_target), (
+            f"Alignment audit failed for store={store}, id={sid}, origin={origin}"
+        )
 
 
 def main():
@@ -85,6 +108,7 @@ def main():
     stores = resolve_stores(getattr(cfg.environment, "store_filter", None))
     print(f"Resolved stores: {stores}")
     print(f"Number of resolved stores: {len(stores)}")
+    assert len(stores) == 10, f"Full audit requires 10 stores, but resolved {len(stores)}: {stores}"
     
     train_end = cfg.dataset.splits.train.end
     val_end = cfg.dataset.splits.validation.end
@@ -100,61 +124,47 @@ def main():
         f"validation forecast period."
     )
     
-    print("Building original training schema and target normalizer...")
-    train_dfs = []
-    for store in stores:
-        df_s = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
-        if df_s is not None:
-            train_dfs.append(df_s[df_s["time_idx"] <= train_end])
-    df_train_full = pd.concat(train_dfs, ignore_index=True)
-    for col in ["id", "item_id", "dept_id", "cat_id", "store_id", "state_id", "weekday", "month", "year", "event_name_1", "event_type_1"]:
-        if col in df_train_full.columns:
-            df_train_full[col] = df_train_full[col].astype(str).astype("category")
-            
-    print_memory("df_train_full")
-    
+    # ------------------------------------------------------------------
+    # STORE-BY-STORE STREAMING SETUP FOR MINIMAL RAM USAGE
+    # ------------------------------------------------------------------
+    print("\n[1/5] Loading training schema and computing historical stats store-by-store...")
+    hist_stats_list = []
     origin_for_stats = val_start - 1
-    df_hist_stats = (
-        df_train_full[df_train_full["time_idx"] <= origin_for_stats]
-        .groupby("id")
-        .agg(
-            mean_sales=("sales", "mean"),
-            total_sales=("sales", "sum"),
-            zero_pct=("sales", lambda x: (x == 0).mean()),
-        )
-        .reset_index()
-    )
     
-    train_ds = build_timeseries_dataset(df_train_full, cfg, is_train=True)
-    del df_train_full
-    print_memory("train_ds")
-    
-    print("Building validation dataset...")
-    val_dfs = []
     for store in stores:
         df_s = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
         if df_s is not None:
-            val_dfs.append(df_s[(df_s["time_idx"] >= min_idx) & (df_s["time_idx"] <= val_end)])
-    df_val_full = pd.concat(val_dfs, ignore_index=True)
-    for col in ["id", "item_id", "dept_id", "cat_id", "store_id", "state_id", "weekday", "month", "year", "event_name_1", "event_type_1"]:
-        if col in df_val_full.columns:
-            df_val_full[col] = df_val_full[col].astype(str).astype("category")
+            df_train_part = df_s[df_s["time_idx"] <= train_end].copy()
             
-    print(f"Validation series count: {df_val_full['id'].nunique()}")
-    print("Validation time range:", df_val_full["time_idx"].min(), df_val_full["time_idx"].max())
+            # Historical statistics per series for demand regime classification
+            h_stats = (
+                df_train_part[df_train_part["time_idx"] <= origin_for_stats]
+                .groupby("id")
+                .agg(
+                    mean_sales=("sales", "mean"),
+                    total_sales=("sales", "sum"),
+                    zero_pct=("sales", lambda x: (x == 0).mean()),
+                )
+                .reset_index()
+            )
+            hist_stats_list.append(h_stats)
+            del df_train_part
+        del df_s
+        gc.collect()
+
+    if not hist_stats_list:
+        raise RuntimeError("No training partitions were loaded for historical stats.")
+    df_hist_stats = pd.concat(hist_stats_list, ignore_index=True)
+    df_hist_stats["id"] = df_hist_stats["id"].astype(str)
+    del hist_stats_list
     
-    assert len(stores) == 10, f"Full audit requires 10 stores, but resolved {len(stores)}: {stores}"
-    expected_series_count = 30490
-    actual_series_count = df_val_full["id"].nunique()
-    assert actual_series_count == expected_series_count, (
-        f"Expected {expected_series_count} series, found {actual_series_count}. Resolved stores: {stores}"
-    )
-        
-    print_memory("df_val_full")
-            
-    val_ds = TimeSeriesDataSet.from_dataset(train_ds, df_val_full, predict=True, stop_randomization=True)
-    val_dl = val_ds.to_dataloader(train=False, batch_size=1024, num_workers=4)
-    
+    # build_timeseries_dataset(..., is_train=True) loads the cached global metadata
+    # builder and ignores the dataframe argument, so do not concatenate full train.
+    train_ds = build_timeseries_dataset(None, cfg, is_train=True)
+    gc.collect()
+    print_memory("train_ds created")
+
+    # Load models
     student_ckpt = "outputs/student/no_kd/exp_full_phase1/best_student.ckpt"
     teacher_opt_ckpt = "outputs/teacher/tft64_optimized/tft64-opt-epoch=epoch=05-val_loss=val_loss=0.474301.ckpt"
     teacher_hub_ckpt = "outputs/teacher/tft64_huber/tft64-huber-epoch=epoch=05-val_loss=val_loss=0.606112.ckpt"
@@ -165,7 +175,7 @@ def main():
         "Teacher (Huber)": (TemporalFusionTransformer, teacher_hub_ckpt)
     }
     
-    print("Loading models and performing smoke tests...")
+    print("\n[2/5] Loading models...")
     loaded_models = {}
     for m_name, (MClass, ckpt) in models_to_evaluate.items():
         if os.path.exists(ckpt):
@@ -175,7 +185,6 @@ def main():
                 model = MClass.load_from_checkpoint(ckpt, map_location="cpu")
             model.to(device)
             model.eval()
-            smoke_test(m_name, model, val_dl, device)
             loaded_models[m_name] = model
         else:
             print(f"[MISSING] {ckpt}")
@@ -185,74 +194,127 @@ def main():
     missing_models = required_models - loaded_model_names
     if missing_models:
         raise FileNotFoundError(f"Required models were not loaded: {sorted(missing_models)}")
-            
+
+    # Store-by-store prediction streaming loop
+    print("\n[3/5] Running store-by-store batch prediction streaming...")
     all_preds_dfs = []
-    
-    for model_name, model in loaded_models.items():
-        print(f"\nEvaluating {model_name}...")
-        model_start = time.time()
+    total_series_count = 0
+
+    for store_idx, store in enumerate(stores, 1):
+        print(f"  --> Processing Store {store_idx}/{len(stores)}: {store}")
+        df_s = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
+        if df_s is None:
+            continue
+            
+        df_val_slice = df_s[(df_s["time_idx"] >= min_idx) & (df_s["time_idx"] <= val_end)].copy()
+        del df_s
         
-        preds_list = []
-        actuals_list = []
-        series_ids = []
-        store_ids = []
-        origins = []
-        dec_time_idxs = []
-        horizons = []
-        
-        with torch.no_grad():
-            for batch in tqdm(val_dl, desc=f"Inference {model_name}"):
-                x, y = batch
-                x_dev = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in x.items()}
-                actual = y[0].numpy()
-                
-                out = model(x_dev)
-                if "Student" in model_name:
-                    preds = out
-                    if preds.ndim == 3:
-                        preds = preds.squeeze(-1)
-                    preds = preds.cpu().numpy()
-                else:
-                    preds = model.to_prediction(out).cpu().numpy()
-                    
-                _decoded = val_ds.x_to_index(x)
-                
-                for b_idx in range(len(preds)):
-                    series_id = _decoded.iloc[b_idx]["id"]
-                    store_id = _decoded.iloc[b_idx].get("store_id", "UNKNOWN")
-                    dec_times = x["decoder_time_idx"][b_idx].numpy()
-                    origin = dec_times[0] - 1
-                    
-                    for h_idx in range(len(dec_times)):
-                        series_ids.append(series_id)
-                        store_ids.append(store_id)
-                        origins.append(origin)
-                        dec_time_idxs.append(dec_times[h_idx])
-                        horizons.append(h_idx + 1)
-                        preds_list.append(preds[b_idx, h_idx])
-                        actuals_list.append(actual[b_idx, h_idx])
-                        
-        df_preds = pd.DataFrame({
-            "model": model_name,
-            "series_id": series_ids,
-            "store_id": store_ids,
-            "origin": origins,
-            "decoder_time_idx_or_date": dec_time_idxs,
-            "horizon": horizons,
-            "prediction": preds_list,
-            "actual": actuals_list
-        })
-        
-        all_preds_dfs.append(df_preds)
-        print(f"Time for {model_name}: {time.time() - model_start:.2f}s")
-        
+        for col in ["id", "item_id", "dept_id", "cat_id", "store_id", "state_id", "weekday", "month", "year", "event_name_1", "event_type_1"]:
+            if col in df_val_slice.columns:
+                df_val_slice[col] = df_val_slice[col].astype(str).astype("category")
+
+        store_series_num = df_val_slice["id"].nunique()
+        total_series_count += store_series_num
+
+        if len(df_val_slice) == 0:
+            continue
+
+        val_ds_store = TimeSeriesDataSet.from_dataset(train_ds, df_val_slice, predict=True, stop_randomization=True)
+        decoded_store = val_ds_store.decoded_index
+        assert decoded_store["time_idx_first_prediction"].nunique() == 1, (
+            f"Multiple prediction starts in store partition: {store}"
+        )
+        assert int(decoded_store["time_idx_first_prediction"].iloc[0]) == val_start, (
+            f"Prediction start mismatch for {store}: expected {val_start}, "
+            f"got {decoded_store['time_idx_first_prediction'].iloc[0]}"
+        )
+        assert decoded_store["id"].is_unique, f"Duplicate series IDs in store partition: {store}"
+
+        val_dl_store = val_ds_store.to_dataloader(
+            train=False,
+            batch_size=cfg.teacher.batch_size,
+            shuffle=False,
+            num_workers=getattr(cfg.environment, "num_workers", 0),
+        )
+
+        if store_idx == 1:
+            for m_name, model in loaded_models.items():
+                smoke_test(m_name, model, val_dl_store, device)
+
+        store_actuals = []
+        for _, batch_y in val_dl_store:
+            target = batch_y[0] if isinstance(batch_y, (tuple, list)) else batch_y
+            store_actuals.append(target.cpu().numpy())
+        actuals_np = np.concatenate(store_actuals, axis=0)
+        assert actuals_np.shape[1] == H, f"Expected H={H} targets for {store}, got {actuals_np.shape[1]}"
+        assert np.isfinite(actuals_np).all(), f"Non-finite actuals for store={store}"
+        audit_store_target_alignment(df_val_slice, decoded_store, val_start, H, actuals_np, store)
+
+        for model_name, model in loaded_models.items():
+            preds_np = get_predictions(model, val_dl_store)
+            assert preds_np.shape == actuals_np.shape, (
+                f"{model_name} shape mismatch for store={store}: "
+                f"predictions={preds_np.shape}, targets={actuals_np.shape}"
+            )
+            assert np.isfinite(preds_np).all(), (
+                f"Non-finite predictions from {model_name} for store={store}"
+            )
+
+            preds_list = []
+            actuals_list = []
+            series_ids = []
+            store_ids = []
+            origins = []
+            dec_time_idxs = []
+            horizons = []
+
+            for row_idx, row in decoded_store.reset_index(drop=True).iterrows():
+                series_id = row["id"]
+                store_id = row.get("store_id", store)
+                first_prediction = int(row["time_idx_first_prediction"])
+                origin = first_prediction - 1
+
+                for h_idx in range(H):
+                    series_ids.append(series_id)
+                    store_ids.append(store_id)
+                    origins.append(origin)
+                    dec_time_idxs.append(first_prediction + h_idx)
+                    horizons.append(h_idx + 1)
+                    preds_list.append(preds_np[row_idx, h_idx])
+                    actuals_list.append(actuals_np[row_idx, h_idx])
+
+            df_preds_store = pd.DataFrame({
+                "model": model_name,
+                "series_id": series_ids,
+                "store_id": store_ids,
+                "origin": origins,
+                "decoder_time_idx_or_date": dec_time_idxs,
+                "horizon": horizons,
+                "prediction": preds_list,
+                "actual": actuals_list
+            })
+            all_preds_dfs.append(df_preds_store)
+
+        del df_val_slice, val_ds_store, val_dl_store
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     df_all_preds = pd.concat(all_preds_dfs, ignore_index=True)
-    print_memory("df_all_preds")
-    
+    del all_preds_dfs
+    gc.collect()
+    print_memory("df_all_preds compiled")
+
+    expected_series_count = 30490
+    print(f"Total validation series count across stores: {total_series_count}")
+    assert total_series_count == expected_series_count, (
+        f"Expected {expected_series_count} series, but found {total_series_count}"
+    )
+
     # ------------------------------------------------------------------
     # EXPLICIT ALIGNMENT CHECKS
     # ------------------------------------------------------------------
-    print("\nVerifying key-set equality and row counts...")
+    print("\n[4/5] Verifying key-set equality and row counts...")
     model_names = df_all_preds['model'].unique()
     num_series = df_all_preds['series_id'].nunique()
     num_origins = df_all_preds['origin'].nunique()
@@ -309,38 +371,42 @@ def main():
     
     # ------------------------------------------------------------------
     # AUTHORITATIVE METRICS CALCULATION
-    # compute_wrmsse_weights_and_scales(df_train, train_end) -> weights, scales, scale_diag
-    # compute_mase_scales(df_train, train_end) -> dict {series_id: scale}
-    # compute_mase(actuals_2d, forecasts_2d, scales_1d_array) -> float
-    # compute_hierarchical_wrmsse(df_gt, df_pred, weights, scales) -> (wrmsse, level_wrmsses)
     # ------------------------------------------------------------------
-    print("\nCalculating authoritative WRMSSE and MASE...")
+    print("\n[5/5] Calculating authoritative WRMSSE and MASE...")
     print("Loading weights and scales from training data...")
 
-    # Build df_train_for_metrics: training rows only, needed by weight/scale functions
     train_dfs_metrics = []
     for store in stores:
         df_s = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
         if df_s is not None:
-            train_dfs_metrics.append(df_s[df_s["time_idx"] <= train_end])
+            train_dfs_metrics.append(df_s[df_s["time_idx"] <= train_end].copy())
+        del df_s
     df_train_for_metrics = pd.concat(train_dfs_metrics, ignore_index=True)
     del train_dfs_metrics
-    print_memory("df_train_for_metrics")
 
     weights_dict, scales_dict, scale_diag = compute_wrmsse_weights_and_scales(df_train_for_metrics, train_end)
     mase_scales_dict = compute_mase_scales(df_train_for_metrics, train_end)
     del df_train_for_metrics
+    gc.collect()
 
-    # Build series_ids in the same sorted order as evaluate_models.py uses
-    series_ids = df_val_full["id"].astype(str).drop_duplicates().sort_values().to_numpy()
-    assert len(series_ids) == expected_series_count, f"Series count mismatch after reload: {len(series_ids)}"
-    missing_mase = [sid for sid in series_ids if sid not in mase_scales_dict]
-    assert not missing_mase, f"Missing MASE scales for {len(missing_mase)} series"
-    scales_array = np.array([mase_scales_dict[sid] for sid in series_ids])  # shape (N,)
-
-    df_val_gt = df_val_full[(df_val_full["time_idx"] >= val_start) & (df_val_full["time_idx"] <= val_end)].copy()
+    # Load validation ground truth store by store
+    val_gt_dfs = []
+    for store in stores:
+        df_s = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
+        if df_s is not None:
+            val_gt_dfs.append(df_s[(df_s["time_idx"] >= val_start) & (df_s["time_idx"] <= val_end)].copy())
+        del df_s
+    df_val_gt = pd.concat(val_gt_dfs, ignore_index=True)
+    del val_gt_dfs
+    
     df_val_gt["id"] = df_val_gt["id"].astype(str)
     df_val_gt = df_val_gt.sort_values(["id", "time_idx"]).reset_index(drop=True)
+
+    series_ids = df_val_gt["id"].drop_duplicates().to_numpy()
+    assert len(series_ids) == expected_series_count, f"Series count mismatch: {len(series_ids)}"
+    missing_mase = [sid for sid in series_ids if sid not in mase_scales_dict]
+    assert not missing_mase, f"Missing MASE scales for {len(missing_mase)} series"
+    scales_array = np.array([mase_scales_dict[sid] for sid in series_ids])
 
     metrics_records = []
     for m in model_names:
@@ -375,17 +441,16 @@ def main():
 
         wrmsse_result, _ = compute_hierarchical_wrmsse(df_val_metric, df_pred_metric, weights_dict, scales_dict)
 
-        # Build 2D numpy arrays (num_series x H) in series_ids order for MASE
         actuals_wide = (
             df_val_gt.pivot(index="id", columns="time_idx", values="sales")
             .reindex(series_ids)
             .values
-        )  # shape (N, H)
+        )
         preds_wide = (
             df_preds_for_wrmsse.pivot(index="id", columns="time_idx", values="sales")
             .reindex(series_ids)
             .values
-        )  # shape (N, H)
+        )
         assert actuals_wide.shape == (len(series_ids), H), f"actuals_wide shape mismatch: {actuals_wide.shape}"
         assert preds_wide.shape == actuals_wide.shape, f"preds_wide shape mismatch: {preds_wide.shape}"
         assert np.isfinite(actuals_wide).all(), "Non-finite actuals in MASE input"
@@ -449,8 +514,7 @@ def main():
     has_effective_leakage = False
     
     for s_id in sample_series:
-        df_s = df_val_full[df_val_full["id"] == s_id].copy().sort_values("time_idx")
-        s_val_start = df_s["time_idx"].max() - H + 1
+        s_val_start = val_start
         s_origin = s_val_start - 1
         
         for dec_t in range(s_val_start, s_val_start + H):
