@@ -9,7 +9,6 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from tqdm import tqdm
-from omegaconf import OmegaConf
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from utils.config import load_config
