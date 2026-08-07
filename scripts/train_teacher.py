@@ -172,7 +172,14 @@ def main():
         callbacks.append(EpochMetricsLoggingCallback())
 
     # 7. Set up Trainer
-    gradient_clip_val = getattr(cfg.environment, "gradient_clip_val", 0.1)
+    # Experiment-specific clipping takes precedence so teacher experiments can
+    # deliberately test a clipping intervention without changing the shared
+    # cluster environment configuration.
+    gradient_clip_val = getattr(
+        cfg.teacher,
+        "gradient_clip_val",
+        getattr(cfg.environment, "gradient_clip_val", 0.1),
+    )
     trainer = pl.Trainer(
         max_epochs=epochs,
         accelerator=cfg.environment.accelerator,
@@ -245,6 +252,7 @@ def main():
 
     additional_fields = {
         "experiment_identifier": args.exp_name,
+        "gradient_clip_val": gradient_clip_val,
         "scheduler_reduction_events": obs_callback.reduction_events,
         "total_training_duration": obs_callback.total_training_duration,
         "checkpoint_hashes": checkpoint_hashes,

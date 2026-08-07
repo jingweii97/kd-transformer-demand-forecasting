@@ -38,4 +38,9 @@ echo "INITIAL GLOBAL STEP: 0"
 python scripts/train_teacher.py --env dicc --experiment tft64_optimized --exp-name "$EXP_NAME" "$@"
 
 # Run verification
-python scripts/verify_tft_run.py --exp-name "$EXP_NAME" --hidden-size 64
+python scripts/verify_tft_run.py \
+    --exp-name "$EXP_NAME" \
+    --hidden-size 64 \
+    --hidden-continuous-size 8 \
+    --lstm-layers 1 \
+    --attention-heads 4

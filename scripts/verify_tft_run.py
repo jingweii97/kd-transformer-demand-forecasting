@@ -9,6 +9,24 @@ def main():
     parser = argparse.ArgumentParser(description="Verify TFT training outputs")
     parser.add_argument("--exp-name", type=str, required=True, help="Experiment name")
     parser.add_argument("--hidden-size", type=int, required=True, help="Expected hidden_size")
+    parser.add_argument(
+        "--hidden-continuous-size",
+        type=int,
+        default=None,
+        help="Expected hidden_continuous_size; omit to skip this architecture check",
+    )
+    parser.add_argument(
+        "--lstm-layers",
+        type=int,
+        default=None,
+        help="Expected number of TFT LSTM layers; omit to skip this architecture check",
+    )
+    parser.add_argument(
+        "--attention-heads",
+        type=int,
+        default=None,
+        help="Expected TFT attention head count; omit to skip this architecture check",
+    )
     args = parser.parse_args()
 
     exp_dir = os.path.join("outputs", "teacher", args.exp_name)
@@ -76,7 +94,7 @@ def main():
         print(f"ERROR: Metadata experiment_identifier does not match {args.exp_name}")
         sys.exit(1)
 
-    # 9. & 10. Checkpoint hidden_size & hidden_continuous_size
+    # Verify the requested architecture fields against the checkpoint.
     h_size = model.hparams.hidden_size
     if h_size != args.hidden_size:
         print(f"ERROR: Expected hidden_size {args.hidden_size}, got {h_size}")
@@ -85,8 +103,24 @@ def main():
     hc_size = getattr(model.hparams, "hidden_continuous_size", None)
     if hc_size is None and hasattr(model.hparams, "get"):
         hc_size = model.hparams.get("hidden_continuous_size", 8)
-    if hc_size != 8:
-        print(f"ERROR: Expected hidden_continuous_size 8, got {hc_size}")
+    if args.hidden_continuous_size is not None and hc_size != args.hidden_continuous_size:
+        print(
+            "ERROR: Expected hidden_continuous_size "
+            f"{args.hidden_continuous_size}, got {hc_size}"
+        )
+        sys.exit(1)
+
+    lstm_layers = getattr(model.hparams, "lstm_layers", None)
+    if args.lstm_layers is not None and lstm_layers != args.lstm_layers:
+        print(f"ERROR: Expected lstm_layers {args.lstm_layers}, got {lstm_layers}")
+        sys.exit(1)
+
+    attention_heads = getattr(model.hparams, "attention_head_size", None)
+    if args.attention_heads is not None and attention_heads != args.attention_heads:
+        print(
+            f"ERROR: Expected attention_head_size {args.attention_heads}, "
+            f"got {attention_heads}"
+        )
         sys.exit(1)
 
 

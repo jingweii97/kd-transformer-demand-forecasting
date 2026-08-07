@@ -39,4 +39,9 @@ echo "TFT-64 ARTIFACTS WILL NOT BE LOADED"
 python scripts/train_teacher.py --env dicc --experiment tft128_optimized --exp-name "$EXP_NAME" "$@"
 
 # Run verification
-python scripts/verify_tft_run.py --exp-name "$EXP_NAME" --hidden-size 128
+python scripts/verify_tft_run.py \
+    --exp-name "$EXP_NAME" \
+    --hidden-size 128 \
+    --hidden-continuous-size 8 \
+    --lstm-layers 1 \
+    --attention-heads 4
