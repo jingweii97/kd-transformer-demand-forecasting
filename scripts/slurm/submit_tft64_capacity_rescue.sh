@@ -10,25 +10,13 @@
 #SBATCH --output=logs/slurm/tft64_cap_%j.out
 #SBATCH --error=logs/slurm/tft64_cap_%j.err
 
-set -euo pipefail
-
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$REPO_ROOT"
+set -e
 
 EXP_NAME="tft64_capacity_rescue"
 
-# Match the established teacher-job behavior: set up/reuse the cluster scratch
-# workspace before resolving output and artifact paths.
+# Match the established teacher-job behavior in the Slurm working directory.
 if [ -f "scripts/slurm/setup_hpc_storage.sh" ]; then
-    mkdir -p logs/slurm
-    if command -v flock >/dev/null 2>&1; then
-        (
-            flock -x 9
-            bash scripts/slurm/setup_hpc_storage.sh
-        ) 9>logs/slurm/.hpc_storage_setup.lock
-    else
-        bash scripts/slurm/setup_hpc_storage.sh
-    fi
+    bash scripts/slurm/setup_hpc_storage.sh || true
 fi
 
 # Never overwrite an experiment; use a new EXP_NAME for a deliberate rerun.
@@ -40,8 +28,6 @@ fi
 module load miniconda/24.1.2 2>/dev/null || module load miniconda/3 2>/dev/null || echo "[Info] Using default system conda"
 source "$(conda info --base)"/etc/profile.d/conda.sh 2>/dev/null || true
 conda activate m5_env 2>/dev/null || true
-
-mkdir -p logs/slurm
 
 python -c "from utils.config import load_config; c=load_config('dicc', 'tft64_capacity_rescue'); v={'hidden_size':c.teacher.hidden_size,'hidden_continuous_size':c.teacher.hidden_continuous_size,'lstm_layers':c.teacher.lstm_layers,'attention_head_size':c.teacher.attention_heads,'loss':c.teacher.loss,'output_size':1,'gradient_clip_val':c.teacher.gradient_clip_val,'resume_checkpoint':'none'}; e={'hidden_size':64,'hidden_continuous_size':16,'lstm_layers':2,'attention_head_size':4,'loss':'huber','output_size':1,'gradient_clip_val':0.1,'resume_checkpoint':'none'}; assert v == e, (v, e); print('EFFECTIVE CAPACITY-RESCUE CONFIG:'); [print(f'{k} = {v[k]}') for k in e]"
 
