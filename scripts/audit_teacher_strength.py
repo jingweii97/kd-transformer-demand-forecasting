@@ -105,12 +105,20 @@ def prepare_partition(frame):
     return frame
 
 
-def raw_targets_for_batch(frame, training_dataset, batch_x, horizon):
-    """Recover raw sales for the exact ids and decoder times of one batch."""
-    encoder = training_dataset._categorical_encoders["id"]
-    id_codes = batch_x["groups"][:, 0].detach().cpu().numpy()
-    series_ids = [str(value) for value in encoder.inverse_transform(id_codes)]
+def raw_targets_for_batch(frame, decoded_index, batch_x, batch_size, horizon):
+    """Recover raw sales for the exact ids and decoder times of one batch.
+
+    ``groups`` is an encoded tensor and may use the label encoder's NaN token.
+    ``decoded_index`` is the authoritative id mapping used by the evaluator.
+    """
+    if len(decoded_index) < batch_size:
+        raise AssertionError("Decoded index has fewer rows than the matched batch")
+    matched_rows = decoded_index.iloc[:batch_size].reset_index(drop=True)
+    series_ids = matched_rows["id"].astype(str).tolist()
     starts = batch_x["decoder_time_idx"][:, 0].detach().cpu().numpy().astype(int)
+    decoded_starts = matched_rows["time_idx_first_prediction"].to_numpy(dtype=int)
+    if not np.array_equal(starts, decoded_starts):
+        raise AssertionError("First validation batch is not aligned with decoded_index")
 
     raw = frame[["id", "time_idx", "sales"]].copy()
     raw["id"] = raw["id"].astype(str)
@@ -129,12 +137,14 @@ def raw_targets_for_batch(frame, training_dataset, batch_x, horizon):
     return np.asarray(rows, dtype=np.float32), series_ids, starts.tolist()
 
 
-def effective_huber_audit(teacher, student, loader, raw_frame, training_dataset, device, horizon):
+def effective_huber_audit(
+    teacher, student, loader, raw_frame, decoded_index, training_dataset, device, horizon
+):
     """Audit the exact tensor domain and reduction for one matched batch."""
     batch_x, batch_y = next(iter(loader))
     target = batch_y[0] if isinstance(batch_y, (tuple, list)) else batch_y
     raw_targets, series_ids, starts = raw_targets_for_batch(
-        raw_frame, training_dataset, batch_x, horizon
+        raw_frame, decoded_index, batch_x, len(target), horizon
     )
     target_cpu = target.detach().float().cpu()
     if raw_targets.shape != tuple(target_cpu.shape):
@@ -452,7 +462,7 @@ def main():
         )
         if loss_audit is None:
             loss_audit = effective_huber_audit(
-                huber, student, loader, frame, training_dataset, device, horizon
+                huber, student, loader, frame, decoded, training_dataset, device, horizon
             )
 
         store_actuals = []
