@@ -15,9 +15,18 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-if [ ! -e "outputs" ] || [ ! -e "artifacts" ]; then
-    echo "ERROR: outputs/ or artifacts/ is unavailable. Run scripts/slurm/setup_hpc_storage.sh once before submitting jobs."
-    exit 1
+# Match the established teacher-job behavior: set up/reuse the cluster scratch
+# workspace before resolving existing checkpoint and artifact paths.
+if [ -f "scripts/slurm/setup_hpc_storage.sh" ]; then
+    mkdir -p logs/slurm
+    if command -v flock >/dev/null 2>&1; then
+        (
+            flock -x 9
+            bash scripts/slurm/setup_hpc_storage.sh
+        ) 9>logs/slurm/.hpc_storage_setup.lock
+    else
+        bash scripts/slurm/setup_hpc_storage.sh
+    fi
 fi
 
 module load miniconda/24.1.2 2>/dev/null || module load miniconda/3 2>/dev/null || echo "[Info] Using default system conda"

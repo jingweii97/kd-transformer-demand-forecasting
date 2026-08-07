@@ -17,9 +17,18 @@ cd "$REPO_ROOT"
 
 EXP_NAME="tft64_capacity_rescue"
 
-if [ ! -e "outputs" ] || [ ! -e "artifacts" ]; then
-    echo "ERROR: outputs/ or artifacts/ is unavailable. Run scripts/slurm/setup_hpc_storage.sh once before submitting jobs."
-    exit 1
+# Match the established teacher-job behavior: set up/reuse the cluster scratch
+# workspace before resolving output and artifact paths.
+if [ -f "scripts/slurm/setup_hpc_storage.sh" ]; then
+    mkdir -p logs/slurm
+    if command -v flock >/dev/null 2>&1; then
+        (
+            flock -x 9
+            bash scripts/slurm/setup_hpc_storage.sh
+        ) 9>logs/slurm/.hpc_storage_setup.lock
+    else
+        bash scripts/slurm/setup_hpc_storage.sh
+    fi
 fi
 
 # Never overwrite an experiment; use a new EXP_NAME for a deliberate rerun.
