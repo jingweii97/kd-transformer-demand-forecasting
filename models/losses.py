@@ -23,6 +23,23 @@ class HuberLossMetric(MultiHorizonMetric):
         return loss_val
 
 
+class MSELossMetric(MultiHorizonMetric):
+    """Plain point mean-squared-error for one-output TFT forecasts.
+
+    ``MultiHorizonMetric`` applies the decoder-length mask and averages the
+    returned elementwise values over valid decoder elements.  This class
+    deliberately receives no target weights: it is the legacy unweighted
+    Huber data path with only its point objective changed.
+    """
+
+    def loss(self, y_pred, target):
+        # TFT point predictions are [batch, horizon, 1]; targets are
+        # [batch, horizon]. Preserve the raw target/prediction domain.
+        if y_pred.ndim > target.ndim:
+            y_pred = y_pred.squeeze(-1)
+        return torch.square(y_pred - target)
+
+
 class WRMSSEInformedLossMetric(MultiHorizonMetric):
     """Squared error whose fixed per-series coefficient arrives as target weight.
 

@@ -22,6 +22,7 @@ from utils.paths import get_dataset_dir
 from data.cache import load_from_cache, resolve_stores
 from data.dataset import build_timeseries_dataset
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
+from models.losses import MSELossMetric
 from scripts.evaluate_models import (
     compute_wrmsse_weights_and_scales,
     compute_hierarchical_wrmsse,
@@ -77,7 +78,12 @@ def evaluate_checkpoint(ckpt_path, ds_dir, cfg, df_train, train_end,
     model.eval()
     total_params = sum(p.numel() for p in model.parameters())
     is_quantile = hasattr(model.loss, "quantiles")
-    objective = "Quantile" if is_quantile else "Huber"
+    if is_quantile:
+        objective = "Quantile"
+    elif isinstance(model.loss, MSELossMetric):
+        objective = "MSE"
+    else:
+        objective = "Huber"
     internal_epoch = model.current_epoch
     global_step = model.global_step
     hidden_size = getattr(model.hparams, "hidden_size", None)
@@ -251,7 +257,7 @@ def evaluate_checkpoint(ckpt_path, ds_dir, cfg, df_train, train_end,
     del model
     torch.cuda.empty_cache()
 
-    return {
+    result = {
         "checkpoint": os.path.basename(ckpt_path),
         "internal_epoch": internal_epoch,
         "global_step": global_step,
@@ -269,11 +275,22 @@ def evaluate_checkpoint(ckpt_path, ds_dir, cfg, df_train, train_end,
         "actual_total": total_actual,
         "predicted_total": total_pred,
     }
+    result.update({
+        f"validation_WRMSSE_Level_{level}": float(score)
+        for level, score in enumerate(level_wrmsses, start=1)
+    })
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default="local")
+    parser.add_argument(
+        "--checkpoint-glob",
+        type=str,
+        default=None,
+        help="Evaluate every checkpoint matching this glob with the common validation evaluator.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.env)
@@ -294,6 +311,12 @@ def main():
         ("Teacher-v3: Huber (Epoch 8)",
          "outputs/teacher/tft64_huber/tft64-huber-epoch=epoch=08-val_loss=val_loss=0.612628.ckpt"),
     ]
+    if args.checkpoint_glob:
+        import glob
+        matched = sorted(glob.glob(args.checkpoint_glob))
+        if not matched:
+            raise FileNotFoundError(f"No checkpoints matched: {args.checkpoint_glob}")
+        checkpoints = [(os.path.basename(path), path) for path in matched]
 
     print("\nCheckpoint existence check:")
     for label, path in checkpoints:
@@ -350,6 +373,7 @@ def main():
         "validation_WAPE", "validation_seasonal_MASE", "aggregate_percentage_bias",
         "actual_total", "predicted_total", "checkpoint_SHA256",
     ]
+    columns.extend(f"validation_WRMSSE_Level_{level}" for level in range(1, 13))
     df_results = df_results[[c for c in columns if c in df_results.columns]]
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

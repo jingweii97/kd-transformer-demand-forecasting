@@ -1,0 +1,19 @@
+# Plain-MSE control: all scientific/training settings match tft64_huber.
+
+teacher:
+  loss: "mse"
+  output_size: 1
+  hidden_size: 64
+  hidden_continuous_size: 8
+  lstm_layers: 1
+  attention_head_size: 4
+  dropout: 0.1
+  lr: 0.001
+  batch_size: 256
+  epochs: 20
+  scheduler_patience: 2
+  early_stopping_patience: 8
+  save_top_k: 5
+  checkpoint_filename: "tft64-mse-epoch={epoch:02d}-val_mse={val_loss:.6f}"
+  checkpoint_auto_insert_metric_name: false
+  gradient_clip_val: 0.1

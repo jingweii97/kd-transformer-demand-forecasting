@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import pandas as pd
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 
@@ -172,7 +173,10 @@ def main():
         filename=checkpoint_filename,
         save_top_k=save_top_k,
         save_last=True,
-        mode="min"
+        mode="min",
+        auto_insert_metric_name=getattr(
+            cfg.teacher, "checkpoint_auto_insert_metric_name", True
+        ),
     )
     
     early_stop_patience = getattr(cfg.teacher, "early_stopping_patience", cfg.teacher.patience)
@@ -224,6 +228,26 @@ def main():
     # Save experiment metadata
     import hashlib
     checkpoint_hashes = []
+    metrics_by_epoch = {}
+    cumulative_duration = 0.0
+    metrics_path = os.path.join(exp_dir, "metrics.csv")
+    if os.path.isfile(metrics_path):
+        metrics_frame = pd.read_csv(metrics_path)
+        for epoch, group in metrics_frame.groupby("epoch", sort=True):
+            validation_rows = group[group["val_loss"].notna()]
+            timing_rows = group[group["epoch_duration"].notna()]
+            if not timing_rows.empty:
+                cumulative_duration += float(timing_rows.iloc[-1]["epoch_duration"])
+            if not validation_rows.empty:
+                row = validation_rows.iloc[-1]
+                lr_rows = group[group["learning_rate"].notna()]
+                metrics_by_epoch[int(epoch)] = {
+                    "validation_loss": float(row["val_loss"]),
+                    "validation_mae": float(row["val_MAE"]) if pd.notna(row.get("val_MAE")) else None,
+                    "validation_rmse": float(row["val_RMSE"]) if pd.notna(row.get("val_RMSE")) else None,
+                    "learning_rate": float(lr_rows.iloc[-1]["learning_rate"]) if not lr_rows.empty else None,
+                    "training_duration_seconds": cumulative_duration,
+                }
     best_validation_loss = None
     for f in os.listdir(exp_dir):
         if f.endswith(".ckpt"):
@@ -238,16 +262,10 @@ def main():
                 ckpt_data = torch.load(ckpt_p, map_location="cpu")
                 epoch = ckpt_data.get("epoch")
                 global_step = ckpt_data.get("global_step")
-                callbacks_data = ckpt_data.get("callbacks", {})
-                score = None
-                for cb_type, cb_state in callbacks_data.items():
-                    if "ModelCheckpoint" in cb_type and "best_model_score" in cb_state:
-                        sc = cb_state.get("best_model_score")
-                        if sc is not None:
-                            score = sc.item() if isinstance(sc, torch.Tensor) else sc
-                            break
+                epoch_metrics = metrics_by_epoch.get(epoch, {})
+                score = epoch_metrics.get("validation_loss")
             except Exception:
-                epoch, global_step, score = None, None, None
+                epoch, global_step, score, epoch_metrics = None, None, None, {}
 
             if os.path.normpath(ckpt_p) == os.path.normpath(best_path):
                 best_validation_loss = score
@@ -260,6 +278,12 @@ def main():
                 "global_step": global_step,
                 "monitored_metric": "val_loss",
                 "monitored_score": score,
+                "validation_mse": score if getattr(cfg.teacher, "loss", "quantile").lower() == "mse" else None,
+                "validation_mae": epoch_metrics.get("validation_mae"),
+                "validation_rmse": epoch_metrics.get("validation_rmse"),
+                "learning_rate": epoch_metrics.get("learning_rate"),
+                "training_duration_seconds": epoch_metrics.get("training_duration_seconds"),
+                "parameter_count": int(tft.size()),
                 "checkpoint_path": ckpt_p,
                 "file_size": sz,
                 "sha256_hash": sha256
