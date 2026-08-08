@@ -21,3 +21,18 @@ class HuberLossMetric(MultiHorizonMetric):
         # Calculate element-wise huber loss
         loss_val = F.huber_loss(y_pred, target, reduction='none', delta=self.delta)
         return loss_val
+
+
+class WRMSSEInformedLossMetric(MultiHorizonMetric):
+    """Squared error whose fixed per-series coefficient arrives as target weight.
+
+    ``MultiHorizonMetric.update`` multiplies this elementwise loss by the second
+    tensor in ``(target, weight)`` before masking invalid decoder positions and
+    reducing by the valid decoder-element count.  No batch renormalization is
+    performed.
+    """
+
+    def loss(self, y_pred, target):
+        if y_pred.ndim > target.ndim:
+            y_pred = y_pred.squeeze(-1)
+        return torch.square(y_pred - target)

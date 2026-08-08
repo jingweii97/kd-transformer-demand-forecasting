@@ -30,6 +30,11 @@ from utils.seed import set_seed
 from data.cache import load_from_cache, load_dataset_from_cache, resolve_stores
 from data.dataset import build_timeseries_dataset
 from models.student import M5TransformerStudent
+from utils.wrmsse import (
+    compute_rmsse_scale,
+    economic_weight_numerators,
+    normalize_economic_weight,
+)
 
 HIERARCHY_LEVELS = [
     [], ['state_id'], ['store_id'], ['cat_id'], ['dept_id'],
@@ -117,35 +122,7 @@ def _compute_scale(series: np.ndarray):
 
     """
 
-    FALLBACK = 1e-4
-
-    if len(series) < 2:
-
-        return FALLBACK, "insufficient_length"
-
-    first_nonzero_idx = np.argmax(series > 0)
-
-    if series[first_nonzero_idx] == 0:
-
-        # np.argmax returns 0 when all elements are 0 (no True found)
-
-        return FALLBACK, "all_zero"
-
-    trimmed = series[first_nonzero_idx:]
-
-    if len(trimmed) < 2:
-
-        return FALLBACK, "insufficient_length"
-
-    sq_diffs = np.diff(trimmed.astype(float)) ** 2
-
-    scale = float(np.mean(sq_diffs))
-
-    if scale <= 0:
-
-        return FALLBACK, "zero_variance"
-
-    return scale, "valid"
+    return compute_rmsse_scale(series)
 
 def compute_wrmsse_weights_and_scales(df_train, train_end):
 
@@ -271,9 +248,7 @@ def compute_wrmsse_weights_and_scales(df_train, train_end):
 
                                          .sum().reset_index())
 
-            df_grouped_weight = (df_weight_window.groupby(group_cols)['dollar_value']
-
-                                                 .sum().reset_index())
+            df_grouped_weight = economic_weight_numerators(df_weight_window, group_cols)
 
 
 
@@ -319,7 +294,7 @@ def compute_wrmsse_weights_and_scales(df_train, train_end):
 
                     key_str = str(keys_vals[0])
 
-                w = float(row['dollar_value'] / total_dollar_sum) if total_dollar_sum > 0 else 0.0
+                w = normalize_economic_weight(row['dollar_value'], total_dollar_sum)
 
                 weights_dict[level_name][key_str] = w
 

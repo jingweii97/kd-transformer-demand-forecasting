@@ -1,5 +1,5 @@
 from pytorch_forecasting import TemporalFusionTransformer, QuantileLoss
-from models.losses import HuberLossMetric
+from models.losses import HuberLossMetric, WRMSSEInformedLossMetric
 
 def create_tft_teacher(training_dataset, cfg):
     """
@@ -11,6 +11,9 @@ def create_tft_teacher(training_dataset, cfg):
     if loss_type.lower() == "huber":
         huber_delta = getattr(cfg.teacher, "huber_delta", 1.0)
         loss = HuberLossMetric(delta=huber_delta)
+        output_size = 1
+    elif loss_type.lower() == "wrmsse_informed":
+        loss = WRMSSEInformedLossMetric()
         output_size = 1
     else:
         loss = QuantileLoss()

@@ -14,6 +14,7 @@ from utils.logging import get_csv_logger
 from data.cache import resolve_stores, is_cache_valid
 from data.dataset import build_timeseries_dataset
 from models.teacher import create_tft_teacher
+from models.wrmsse_informed import build_wrmsse_informed_coefficients
 import torch
 from scripts.observability import ObservabilityCallback
 class EpochMetricsLoggingCallback(pl.Callback):
@@ -100,9 +101,27 @@ def main():
     # 3. Build Datasets
     print("Building TimeSeriesDataSet objects...")
     training_data = build_timeseries_dataset(None, cfg, is_train=True)
+
+    wrmsse_coefficients = None
+    if getattr(cfg.teacher, "loss", "quantile").lower() == "wrmsse_informed":
+        coefficient_bundle = build_wrmsse_informed_coefficients(cfg)
+        if coefficient_bundle.audit["pathological"]:
+            raise RuntimeError(
+                "WRMSSE-informed coefficient distribution is pathological: "
+                + "; ".join(coefficient_bundle.audit["pathological_reasons"])
+            )
+        if not getattr(cfg.teacher, "pretraining_audit_approved", False):
+            raise RuntimeError(
+                "Full WRMSSE-informed training is gated until the pre-training audit is "
+                "reviewed. Run scripts/audit_wrmsse_informed.py, review its report, then "
+                "set teacher.pretraining_audit_approved=true explicitly."
+            )
+        wrmsse_coefficients = coefficient_bundle.by_series
     
     from data.dataset import StorePartitionManager
-    partition_manager = StorePartitionManager(training_data, cfg)
+    partition_manager = StorePartitionManager(
+        training_data, cfg, series_coefficients=wrmsse_coefficients
+    )
 
     # 4. Create DataLoaders via Partition Manager
     train_loader = partition_manager.train_dataloader(batch_size=batch_size)

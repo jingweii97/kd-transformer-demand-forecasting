@@ -12,7 +12,7 @@ from data.cache import load_from_cache, STORES, resolve_stores
 import torch
 
 class StorePartitionedDataset(IterableDataset):
-    def __init__(self, base_dataset, cfg, batch_size, is_train=True, max_idx=None, predict=True, shuffle=True, partition_manager=None, exp_name=None):
+    def __init__(self, base_dataset, cfg, batch_size, is_train=True, max_idx=None, predict=True, shuffle=True, partition_manager=None, exp_name=None, series_coefficients=None):
         super().__init__()
         self.base_dataset = base_dataset
         self.cfg = cfg
@@ -23,6 +23,7 @@ class StorePartitionedDataset(IterableDataset):
         self.shuffle = shuffle
         self.partition_manager = partition_manager
         self.exp_name = exp_name
+        self.series_coefficients = series_coefficients
         
         # Determine the stores to load
         self.stores = resolve_stores(cfg.environment.store_filter)
@@ -118,10 +119,19 @@ class StorePartitionedDataset(IterableDataset):
                     
             if len(df_part_sliced) == 0:
                 continue
+
+            use_wrmsse_weights = self.series_coefficients is not None
+            if use_wrmsse_weights:
+                mapped = df_part_sliced["id"].astype(str).map(self.series_coefficients)
+                if mapped.isna().any():
+                    missing = df_part_sliced.loc[mapped.isna(), "id"].astype(str).unique()[:5]
+                    raise KeyError(f"Missing WRMSSE-informed coefficient(s): {missing.tolist()}")
+                df_part_sliced["wrmsse_informed_coefficient"] = mapped.astype("float32")
                 
             # Construct dataset using PyTorch Forecasting API exactly as intended
             if self.is_train:
-                part_ds = TimeSeriesDataSet.from_dataset(self.base_dataset, df_part_sliced)
+                dataset_kwargs = {"weight": "wrmsse_informed_coefficient"} if use_wrmsse_weights else {}
+                part_ds = TimeSeriesDataSet.from_dataset(self.base_dataset, df_part_sliced, **dataset_kwargs)
                 
                 # Apply configurable window stride (training only).
                 # Uses the official filter() API on time_idx_first_prediction — the decoder
@@ -140,7 +150,8 @@ class StorePartitionedDataset(IterableDataset):
                     self.base_dataset,
                     df_part_sliced,
                     predict=self.predict,
-                    stop_randomization=True
+                    stop_randomization=True,
+                    **({"weight": "wrmsse_informed_coefficient"} if use_wrmsse_weights else {})
                 )
             del df_part_sliced
             
@@ -161,6 +172,10 @@ class StorePartitionedDataset(IterableDataset):
             batch_count = 0
             for batch in part_loader:
                 x, y = batch
+                if use_wrmsse_weights:
+                    if y[1] is None:
+                        raise AssertionError("WRMSSE-informed batch is missing its coefficient tensor")
+                    x["wrmsse_informed_coefficient"] = y[1][:, 0]
                 if store_soft_targets is not None:
                     group_ids = x['groups'][:, 0].long()
                     start_times = x['decoder_time_idx'][:, 0].long()
@@ -299,11 +314,12 @@ class StoreMetadataBuilder:
         )
 
 class StorePartitionManager:
-    def __init__(self, base_dataset, cfg, exp_name=None):
+    def __init__(self, base_dataset, cfg, exp_name=None, series_coefficients=None):
         self.base_dataset = base_dataset
         self.cfg = cfg
         self.exp_name = exp_name
         self._decoded_index = None
+        self.series_coefficients = series_coefficients
 
     def train_dataloader(self, batch_size):
         dataset_iter = StorePartitionedDataset(
@@ -313,7 +329,8 @@ class StorePartitionManager:
             is_train=True,
             shuffle=True,
             partition_manager=self,
-            exp_name=self.exp_name
+            exp_name=self.exp_name,
+            series_coefficients=self.series_coefficients,
         )
         return DataLoader(dataset_iter, batch_size=None, num_workers=0)
 
@@ -327,7 +344,8 @@ class StorePartitionManager:
             predict=True,
             shuffle=False,
             partition_manager=self,
-            exp_name=self.exp_name
+            exp_name=self.exp_name,
+            series_coefficients=self.series_coefficients,
         )
         return DataLoader(dataset_iter, batch_size=None, num_workers=0)
 
@@ -341,7 +359,8 @@ class StorePartitionManager:
             predict=predict,
             shuffle=False,
             partition_manager=self,
-            exp_name=self.exp_name
+            exp_name=self.exp_name,
+            series_coefficients=self.series_coefficients,
         )
         return DataLoader(dataset_iter, batch_size=None, num_workers=0)
 
