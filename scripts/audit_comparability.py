@@ -92,14 +92,37 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default="dicc")
     parser.add_argument("--experiment", type=str, default="full")
+    parser.add_argument(
+        "--model",
+        action="append",
+        nargs=3,
+        metavar=("TYPE", "LABEL", "CHECKPOINT"),
+        help=(
+            "Model to evaluate. TYPE must be 'student' or 'tft'. May be repeated. "
+            "When supplied, replaces the legacy hard-coded comparison list."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="New directory for audit outputs. Refuses to reuse an existing directory.",
+    )
     args = parser.parse_args()
 
     start_time = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Starting audit on device: {device}")
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = resolve_path(f"artifacts/teacher_student_comparability_{timestamp}")
+    if args.output_dir:
+        out_dir = resolve_path(args.output_dir)
+        if os.path.exists(out_dir):
+            raise FileExistsError(
+                f"Refusing to reuse existing audit output directory: {out_dir}"
+            )
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = resolve_path(f"artifacts/teacher_student_comparability_{timestamp}")
     os.makedirs(out_dir, exist_ok=True)
     
     cfg = load_config(env_name=args.env, experiment_name=args.experiment)
@@ -164,22 +187,44 @@ def main():
     gc.collect()
     print_memory("train_ds created")
 
-    # Load models
-    student_ckpt = "outputs/student/no_kd/exp_full_phase1/best_student.ckpt"
-    teacher_opt_ckpt = "outputs/teacher/tft64_optimized/tft64-opt-epoch=epoch=05-val_loss=val_loss=0.474301.ckpt"
-    teacher_hub_ckpt = "outputs/teacher/tft64_huber/tft64-huber-epoch=epoch=05-val_loss=val_loss=0.606112.ckpt"
-    
-    models_to_evaluate = {
-        "Student (No KD)": (M5TransformerStudent, student_ckpt),
-        "Teacher (Quantile)": (TemporalFusionTransformer, teacher_opt_ckpt),
-        "Teacher (Huber)": (TemporalFusionTransformer, teacher_hub_ckpt)
-    }
+    # The default remains the original comparison. --model only changes which
+    # serialized models are supplied; all prediction, alignment, and metric code
+    # below is shared unchanged.
+    if args.model:
+        models_to_evaluate = {}
+        for model_type, label, checkpoint in args.model:
+            if model_type == "student":
+                model_class = M5TransformerStudent
+            elif model_type == "tft":
+                model_class = TemporalFusionTransformer
+            else:
+                raise ValueError(
+                    f"Unsupported --model TYPE '{model_type}'. Use 'student' or 'tft'."
+                )
+            if label in models_to_evaluate:
+                raise ValueError(f"Duplicate --model LABEL: {label}")
+            models_to_evaluate[label] = (model_class, checkpoint)
+    else:
+        models_to_evaluate = {
+            "Student (No KD)": (
+                M5TransformerStudent,
+                "outputs/student/no_kd/exp_full_phase1/best_student.ckpt",
+            ),
+            "Teacher (Quantile)": (
+                TemporalFusionTransformer,
+                "outputs/teacher/tft64_optimized/tft64-opt-epoch=epoch=05-val_loss=val_loss=0.474301.ckpt",
+            ),
+            "Teacher (Huber)": (
+                TemporalFusionTransformer,
+                "outputs/teacher/tft64_huber/tft64-huber-epoch=epoch=05-val_loss=val_loss=0.606112.ckpt",
+            ),
+        }
     
     print("\n[2/5] Loading models...")
     loaded_models = {}
     for m_name, (MClass, ckpt) in models_to_evaluate.items():
         if os.path.exists(ckpt):
-            if "Student" in m_name:
+            if MClass is M5TransformerStudent:
                 model = MClass.load_from_checkpoint(ckpt, training_dataset=train_ds, map_location="cpu")
             else:
                 model = MClass.load_from_checkpoint(ckpt, map_location="cpu")
@@ -439,7 +484,9 @@ def main():
         df_pred_metric = df_preds_for_wrmsse.sort_values(sort_cols).reset_index(drop=True)
         assert df_val_metric[sort_cols].equals(df_pred_metric[sort_cols]), "Ground-truth and prediction metric rows are misaligned"
 
-        wrmsse_result, _ = compute_hierarchical_wrmsse(df_val_metric, df_pred_metric, weights_dict, scales_dict)
+        wrmsse_result, level_wrmsses = compute_hierarchical_wrmsse(
+            df_val_metric, df_pred_metric, weights_dict, scales_dict
+        )
 
         actuals_wide = (
             df_val_gt.pivot(index="id", columns="time_idx", values="sales")
@@ -465,10 +512,16 @@ def main():
         mae = np.mean(np.abs(df_m['prediction'] - df_m['actual']))
         rmse = np.sqrt(np.mean((df_m['prediction'] - df_m['actual'])**2))
 
-        metrics_records.append({
+        metric_record = {
             "model": m, "WRMSSE": float(wrmsse_result), "MAE": float(mae), "RMSE": float(rmse),
-            "WAPE": float(wape), "MASE": float(mase), "Bias": float(bias)
+            "WAPE": float(wape), "MASE": float(mase), "Bias": float(bias),
+            "Actual_Total": float(sum_actual), "Predicted_Total": float(df_m['prediction'].sum()),
+        }
+        metric_record.update({
+            f"WRMSSE_Level_{level}": float(value)
+            for level, value in enumerate(level_wrmsses, start=1)
         })
+        metrics_records.append(metric_record)
 
     df_metrics = pd.DataFrame(metrics_records)
     df_metrics.to_csv(os.path.join(out_dir, "common_validation_metrics.csv"), index=False)
@@ -496,7 +549,14 @@ def main():
         "zero_sales_indicator",
     }
 
-    student_model = loaded_models.get("Student (No KD)")
+    student_model = next(
+        (
+            loaded_models[name]
+            for name, (model_class, _) in models_to_evaluate.items()
+            if model_class is M5TransformerStudent and name in loaded_models
+        ),
+        None,
+    )
     if student_model is not None and hasattr(student_model, "known_real_indices"):
         student_decoder_reals = [train_ds.reals[int(i)] for i in student_model.known_real_indices]
         print("Dataset real-variable order:", list(train_ds.reals))
