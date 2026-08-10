@@ -22,7 +22,7 @@ from utils.paths import get_dataset_dir
 from data.cache import load_from_cache, resolve_stores
 from data.dataset import build_timeseries_dataset
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
-from models.losses import MSELossMetric
+from models.losses import MSELossMetric, WRMSSEInformedLossMetric
 from scripts.evaluate_models import (
     compute_wrmsse_weights_and_scales,
     compute_hierarchical_wrmsse,
@@ -82,6 +82,8 @@ def evaluate_checkpoint(ckpt_path, ds_dir, cfg, df_train, train_end,
         objective = "Quantile"
     elif isinstance(model.loss, MSELossMetric):
         objective = "MSE"
+    elif isinstance(model.loss, WRMSSEInformedLossMetric):
+        objective = "WRMSSE-informed"
     else:
         objective = "Huber"
     internal_epoch = model.current_epoch
@@ -282,6 +284,29 @@ def evaluate_checkpoint(ckpt_path, ds_dir, cfg, df_train, train_end,
     return result
 
 
+def prepare_validation_context(cfg):
+    """Build the shared context used by the authoritative checkpoint evaluator."""
+    ds_dir = get_dataset_dir(cfg)
+    stores = resolve_stores(getattr(cfg.environment, "store_filter", None))
+    train_end = cfg.dataset.splits.train.end
+
+    print("\nLoading training data for scale computation...")
+    train_dfs = []
+    for store in stores:
+        df_s = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
+        if df_s is not None:
+            train_dfs.append(df_s[df_s["time_idx"] <= train_end])
+    df_train = pd.concat(train_dfs, ignore_index=True)
+    del train_dfs
+    print(f"  Train rows: {len(df_train):,}")
+
+    weights_dict, scales_dict, _ = compute_wrmsse_weights_and_scales(df_train, train_end)
+    mase_scales_dict = compute_mase_scales(df_train, train_end)
+    series_ids = df_train["id"].astype(str).drop_duplicates().sort_values().to_numpy()
+    del df_train
+    return ds_dir, train_end, weights_dict, scales_dict, mase_scales_dict, series_ids
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default="local")
@@ -329,25 +354,9 @@ def main():
         return
 
     # ── Pre-load shared data: train split for WRMSSE/MASE scales ─────────────
-    print("\nLoading training data for scale computation...")
-    ds_dir       = get_dataset_dir(cfg)
-    store_filter = getattr(cfg.environment, "store_filter", None)
-    stores       = resolve_stores(store_filter)
-    train_end    = cfg.dataset.splits.train.end
-
-    train_dfs = []
-    for store in stores:
-        df_s = load_from_cache(artifacts_dir=ds_dir, store_filter=store)
-        if df_s is not None:
-            train_dfs.append(df_s[df_s["time_idx"] <= train_end])
-    df_train = pd.concat(train_dfs, ignore_index=True)
-    del train_dfs
-    print(f"  Train rows: {len(df_train):,}")
-
-    weights_dict, scales_dict, scale_diag = compute_wrmsse_weights_and_scales(df_train, train_end)
-    mase_scales_dict = compute_mase_scales(df_train, train_end)
-    series_ids = df_train["id"].astype(str).drop_duplicates().sort_values().to_numpy()
-    del df_train
+    ds_dir, train_end, weights_dict, scales_dict, mase_scales_dict, series_ids = (
+        prepare_validation_context(cfg)
+    )
 
     # ── Evaluate each checkpoint ──────────────────────────────────────────────
     results = []
