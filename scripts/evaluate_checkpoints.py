@@ -21,8 +21,8 @@ from utils.config import load_config
 from utils.paths import get_dataset_dir
 from data.cache import load_from_cache, resolve_stores
 from data.dataset import build_timeseries_dataset
-from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
-from models.losses import MSELossMetric, WRMSSEInformedLossMetric
+from pytorch_forecasting import QuantileLoss, TemporalFusionTransformer, TimeSeriesDataSet
+from models.losses import HuberLossMetric, MSELossMetric, WRMSSEInformedLossMetric
 from scripts.evaluate_models import (
     compute_wrmsse_weights_and_scales,
     compute_hierarchical_wrmsse,
@@ -49,6 +49,28 @@ def get_predictions_tft(model, loader):
     return preds.cpu().numpy()
 
 
+def objective_label(loss):
+    """Return the concrete training objective without attribute inference."""
+    if isinstance(loss, QuantileLoss):
+        return "Quantile"
+    if isinstance(loss, HuberLossMetric):
+        return "Huber"
+    if isinstance(loss, MSELossMetric):
+        return "MSE"
+    if isinstance(loss, WRMSSEInformedLossMetric):
+        return "WRMSSE-informed"
+    return type(loss).__name__
+
+
+def checkpoint_training_state(ckpt_path):
+    """Read persisted training progress; inference-time Lightning counters reset."""
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    return {
+        "internal_epoch": checkpoint.get("epoch"),
+        "global_step": checkpoint.get("global_step"),
+    }
+
+
 def evaluate_checkpoint(ckpt_path, ds_dir, cfg, df_train, train_end,
                         weights_dict, scales_dict, mase_scales_dict, series_ids):
     """
@@ -66,6 +88,7 @@ def evaluate_checkpoint(ckpt_path, ds_dir, cfg, df_train, train_end,
     with open(ckpt_path, "rb") as f:
         sha256 = hashlib.sha256(f.read()).hexdigest()
     ckpt_size = os.path.getsize(ckpt_path)
+    training_state = checkpoint_training_state(ckpt_path)
 
     try:
         model = TemporalFusionTransformer.load_from_checkpoint(
@@ -77,17 +100,9 @@ def evaluate_checkpoint(ckpt_path, ds_dir, cfg, df_train, train_end,
 
     model.eval()
     total_params = sum(p.numel() for p in model.parameters())
-    is_quantile = hasattr(model.loss, "quantiles")
-    if is_quantile:
-        objective = "Quantile"
-    elif isinstance(model.loss, MSELossMetric):
-        objective = "MSE"
-    elif isinstance(model.loss, WRMSSEInformedLossMetric):
-        objective = "WRMSSE-informed"
-    else:
-        objective = "Huber"
-    internal_epoch = model.current_epoch
-    global_step = model.global_step
+    objective = objective_label(model.loss)
+    internal_epoch = training_state["internal_epoch"]
+    global_step = training_state["global_step"]
     hidden_size = getattr(model.hparams, "hidden_size", None)
 
     # ── Build training dataset for TimeSeriesDataSet ─────────────────────────

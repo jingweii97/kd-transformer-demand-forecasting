@@ -20,7 +20,11 @@ import pandas as pd
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.evaluate_checkpoints import evaluate_checkpoint, prepare_validation_context
+from scripts.evaluate_checkpoints import (
+    checkpoint_training_state,
+    evaluate_checkpoint,
+    prepare_validation_context,
+)
 from utils.config import load_config
 
 
@@ -193,7 +197,11 @@ def main():
 
     metadata = {
         "checkpoint_paths_and_hashes": [
-            {"path": os.path.abspath(path), "sha256": digest}
+            {
+                "path": os.path.abspath(path),
+                "sha256": digest,
+                **checkpoint_training_state(path),
+            }
             for digest, path in unique.items()
         ],
         "deduplicated_aliases": aliases,
