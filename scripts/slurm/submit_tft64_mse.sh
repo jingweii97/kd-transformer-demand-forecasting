@@ -28,8 +28,6 @@ module load miniconda/24.1.2 2>/dev/null || module load miniconda/3 2>/dev/null 
 source "$(conda info --base)/etc/profile.d/conda.sh" 2>/dev/null || true
 conda activate m5_env 2>/dev/null || true
 
-mkdir -p logs/slurm
-
 echo "FRESH TFT-64 MSE INITIALIZATION"
 echo "experiment = tft64_mse"
 echo "hidden_size = 64"

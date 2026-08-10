@@ -21,7 +21,6 @@ fi
 module load miniconda/24.1.2 2>/dev/null || module load miniconda/3 2>/dev/null || echo "[Info] Using default system conda"
 source "$(conda info --base)/etc/profile.d/conda.sh" 2>/dev/null || true
 conda activate m5_env 2>/dev/null || true
-mkdir -p logs/slurm
 
 echo "UNIQUE RETAINED WRMSSE-INFORMED CHECKPOINTS AND HASHES"
 python scripts/evaluate_tft64_wrmsse_informed.py --env dicc --print-plan
