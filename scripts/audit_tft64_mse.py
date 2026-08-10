@@ -96,18 +96,25 @@ def _raw_sales_domain_check(training_dataset, cfg, batch_x, target):
     """Confirm this MSE batch uses the same raw-sales tensor path as Huber."""
     group_encoder = training_dataset._categorical_encoders["__group_id__id"]
     series_ids = group_encoder.inverse_transform(batch_x["groups"][:, 0].cpu().numpy())
-    stores = {"_".join(str(series_id).split("_")[-3:-1]) for series_id in series_ids}
-    if len(stores) != 1:
-        raise AssertionError(f"A streamed store batch must contain one store, got {sorted(stores)}")
-    raw_frame = load_from_cache(get_dataset_dir(cfg), stores.pop())
-    lookup = raw_frame.assign(id=raw_frame["id"].astype(str)).set_index(
-        ["id", "time_idx"]
-    )["sales"]
+    store_for_id = {
+        str(series_id): "_".join(str(series_id).split("_")[-3:-1])
+        for series_id in series_ids
+    }
+    lookups = {}
+    for store in sorted(set(store_for_id.values())):
+        store_ids = [series_id for series_id, value in store_for_id.items() if value == store]
+        raw_frame = load_from_cache(get_dataset_dir(cfg), store)
+        raw_frame = raw_frame[raw_frame["id"].astype(str).isin(store_ids)]
+        lookups[store] = raw_frame.assign(id=raw_frame["id"].astype(str)).set_index(
+            ["id", "time_idx"]
+        )["sales"]
     starts = batch_x["decoder_time_idx"][:, 0].detach().cpu().numpy().astype(int)
     raw_rows = []
     for series_id, start in zip(series_ids, starts):
+        series_id = str(series_id)
+        lookup = lookups[store_for_id[series_id]]
         raw_rows.append([
-            lookup[(str(series_id), time_idx)]
+            lookup[(series_id, time_idx)]
             for time_idx in range(start, start + target.shape[1])
         ])
     raw_target = torch.as_tensor(raw_rows, dtype=target.dtype)
@@ -117,6 +124,7 @@ def _raw_sales_domain_check(training_dataset, cfg, batch_x, target):
     return {
         "passed": True,
         "raw_sales_vs_dataset_target_max_abs_gap": max_abs_gap,
+        "stores_checked": sorted(lookups),
         "same_legacy_unweighted_path_as_huber": True,
     }
 
