@@ -12,7 +12,12 @@
 #SBATCH --error=logs/slurm/eval_tft64_wi_%j.err
 
 set -e
-cd "$(dirname "$0")/../.."
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$PWD}"
+cd "$REPO_ROOT"
+if [ ! -f "scripts/evaluate_tft64_wrmsse_informed.py" ]; then
+    echo "Error: submit this job from the repository root; resolved directory: $REPO_ROOT"
+    exit 1
+fi
 
 if [ -f "scripts/slurm/setup_hpc_storage.sh" ]; then
     bash scripts/slurm/setup_hpc_storage.sh || true
