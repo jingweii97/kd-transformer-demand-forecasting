@@ -177,11 +177,52 @@ class StorePartitionedDataset(IterableDataset):
                         raise AssertionError("WRMSSE-informed batch is missing its coefficient tensor")
                     x["wrmsse_informed_coefficient"] = y[1][:, 0]
                 if store_soft_targets is not None:
-                    group_ids = x['groups'][:, 0].long()
                     start_times = x['decoder_time_idx'][:, 0].long()
-                    
-                    local_group_ids = global_to_local[group_ids]
+
+                    # ``x['groups']`` contains PyTorch Forecasting's internal
+                    # ``__group_id__id`` codes.  Those codes are store-local
+                    # for a partitioned dataset, whereas the soft-target cache
+                    # is keyed by the public, globally encoded ``id`` values
+                    # written by generate_soft_targets.py.  Decode the batch
+                    # identity through the dataset before looking up the cache;
+                    # never use the internal codes as global cache indices.
+                    batch_index = part_ds.x_to_index(x)
+                    batch_ids = batch_index["id"].astype(str).to_numpy()
+                    global_group_ids = self.base_dataset._categorical_encoders["id"].transform(batch_ids)
+                    global_group_ids = torch.as_tensor(global_group_ids, dtype=torch.long)
+
+                    if len(global_group_ids) != len(start_times):
+                        raise AssertionError(
+                            "Soft-target lookup identity count does not match batch size: "
+                            f"{len(global_group_ids)} != {len(start_times)}"
+                        )
+                    if (global_group_ids < 0).any() or (global_group_ids >= len(global_to_local)).any():
+                        raise KeyError(
+                            f"Soft-target global series code is out of bounds for store {store}"
+                        )
+                    if (start_times < 0).any() or (start_times >= store_soft_targets.shape[1]).any():
+                        raise IndexError(
+                            f"Soft-target forecast origin is out of bounds for store {store}: "
+                            f"valid range is [0, {store_soft_targets.shape[1] - 1}]"
+                        )
+
+                    local_group_ids = global_to_local[global_group_ids]
+                    if (local_group_ids < 0).any():
+                        missing = batch_ids[local_group_ids.numpy() < 0][:5].tolist()
+                        raise KeyError(
+                            f"Soft-target cache has no mapping for {len(missing)} or more series in store "
+                            f"{store}; examples: {missing}"
+                        )
                     teacher_preds = store_soft_targets[local_group_ids, start_times]
+                    if teacher_preds.shape[-1] != max_prediction_length:
+                        raise AssertionError(
+                            f"Soft-target horizon mismatch for store {store}: "
+                            f"expected {max_prediction_length}, got {teacher_preds.shape[-1]}"
+                        )
+                    if not torch.isfinite(teacher_preds).all():
+                        raise ValueError(
+                            f"Soft-target cache contains missing or non-finite values for store {store}"
+                        )
                     x['soft_targets'] = teacher_preds
                 
                 yield x, y

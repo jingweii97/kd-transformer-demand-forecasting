@@ -4,6 +4,10 @@ import json
 import time
 import argparse
 import datetime
+import hashlib
+import pickle
+import platform
+from importlib import metadata as importlib_metadata
 import torch
 import numpy as np
 
@@ -17,6 +21,76 @@ from data.cache import load_from_cache, resolve_stores, FEATURE_VERSION, is_cach
 from data.dataset import build_timeseries_dataset
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 
+
+def _sha256_file(path, chunk_size=1024 * 1024):
+    """Return a streaming SHA-256 without loading a checkpoint or parquet into RAM."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _sha256_object(value):
+    """Fingerprint serialized dataset state for provenance, not cross-version equality."""
+    return hashlib.sha256(pickle.dumps(value, protocol=4)).hexdigest()
+
+
+def _package_version(distribution):
+    try:
+        return importlib_metadata.version(distribution)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def _assert_dataset_state_matches_checkpoint(training_data, teacher):
+    """Fail before inference if current metadata changes teacher input/target scaling.
+
+    Soft-target generation uses the metadata-backed TimeSeriesDataSet to produce
+    model inputs and ``target_scale``.  A valid parquet feature-version alone is
+    insufficient: a stale metadata pickle can change encoders, normalizers, or
+    real-feature scalers while retaining that version number.
+    """
+    checkpoint_parameters = teacher.hparams.get("dataset_parameters")
+    if checkpoint_parameters is None:
+        raise ValueError("Teacher checkpoint does not contain dataset_parameters for compatibility validation")
+
+    current_parameters = training_data.get_parameters()
+
+    current_id_encoder = current_parameters["categorical_encoders"]["id"]
+    checkpoint_id_encoder = checkpoint_parameters["categorical_encoders"]["id"]
+    if not np.array_equal(current_id_encoder.classes_, checkpoint_id_encoder.classes_):
+        raise ValueError("Generation metadata public id encoder differs from the teacher checkpoint")
+
+    current_normalizer = current_parameters["target_normalizer"]
+    checkpoint_normalizer = checkpoint_parameters["target_normalizer"]
+    current_norm = current_normalizer.norm_.sort_index()
+    checkpoint_norm = checkpoint_normalizer.norm_.sort_index()
+    if (
+        not current_norm.index.equals(checkpoint_norm.index)
+        or list(current_norm.columns) != list(checkpoint_norm.columns)
+        or current_norm.shape != checkpoint_norm.shape
+        or not np.allclose(current_norm.to_numpy(), checkpoint_norm.to_numpy(), rtol=1e-7, atol=1e-8)
+    ):
+        raise ValueError("Generation target normalizer differs from the teacher checkpoint")
+
+    for name, checkpoint_scaler in checkpoint_parameters["scalers"].items():
+        current_scaler = current_parameters["scalers"].get(name)
+        if current_scaler is None:
+            raise ValueError(f"Generation metadata is missing teacher scaler: {name}")
+        for attribute in ("mean_", "scale_", "var_"):
+            if not np.allclose(
+                np.asarray(getattr(current_scaler, attribute)),
+                np.asarray(getattr(checkpoint_scaler, attribute)),
+                rtol=1e-7,
+                atol=1e-8,
+            ):
+                raise ValueError(
+                    f"Generation scaler '{name}' differs from the teacher checkpoint ({attribute})"
+                )
+
+    return current_parameters, checkpoint_parameters
+
 def main():
     parser = argparse.ArgumentParser(description="Generate and Save TFT Teacher Forecasts as Soft Targets")
     parser.add_argument("--env", type=str, default="local", help="Environment configuration name")
@@ -27,6 +101,11 @@ def main():
     parser.add_argument("--batch-size", type=int, default=256, help="Inference batch size")
     parser.add_argument("--max-day", type=int, default=None, 
                         help="Limit inference day range for fast verification (default: end of Validation)")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow replacement of an existing cache partition for this experiment name",
+    )
     args = parser.parse_args()
 
     # B-4: Require an explicit experiment name.
@@ -52,6 +131,9 @@ def main():
     # 1. Verify preprocessed dataset caches exist
     from utils.paths import get_dataset_dir
     ds_dir = get_dataset_dir(cfg)
+    metadata_path = os.path.join(ds_dir, "metadata", "global_metadata.pkl")
+    if not os.path.isfile(metadata_path):
+        raise FileNotFoundError(f"Generation metadata file is missing: {metadata_path}")
     stores = resolve_stores(cfg.environment.store_filter)
     for store in stores:
         if not is_cache_valid(ds_dir, store):
@@ -66,6 +148,10 @@ def main():
 
     # 3. Load Frozen TFT Model
     checkpoint_path_abs = resolve_path(args.checkpoint_path)
+    if not os.path.isfile(checkpoint_path_abs):
+        raise FileNotFoundError(f"Teacher checkpoint is missing: {checkpoint_path_abs}")
+    checkpoint_sha256 = _sha256_file(checkpoint_path_abs)
+    print(f"Teacher checkpoint SHA-256: {checkpoint_sha256}")
     print(f"Loading TFT teacher model from checkpoint: {checkpoint_path_abs}")
     teacher = TemporalFusionTransformer.load_from_checkpoint(checkpoint_path_abs)
     
@@ -73,6 +159,27 @@ def main():
     teacher.eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     teacher = teacher.to(device)
+
+    current_dataset_parameters, checkpoint_dataset_parameters = _assert_dataset_state_matches_checkpoint(
+        training_data, teacher
+    )
+    print("Generation metadata matches the teacher checkpoint's public encoder, normalizer, and scalers.")
+    common_provenance = {
+        "checkpoint_path": str(checkpoint_path_abs),
+        "checkpoint_sha256": checkpoint_sha256,
+        "metadata_path": str(metadata_path),
+        "metadata_sha256": _sha256_file(metadata_path),
+        "generation_dataset_state_sha256": _sha256_object(current_dataset_parameters),
+        "teacher_dataset_state_sha256": _sha256_object(checkpoint_dataset_parameters),
+        "target_normalizer_state_sha256": _sha256_object(current_dataset_parameters["target_normalizer"]),
+        "categorical_encoders_state_sha256": _sha256_object(current_dataset_parameters["categorical_encoders"]),
+        "package_versions": {
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "pytorch_forecasting": _package_version("pytorch-forecasting"),
+            "lightning": _package_version("lightning"),
+        },
+    }
 
     import gc
     from data.cache import STORES
@@ -98,6 +205,13 @@ def main():
 
     for store in stores:
         print(f"Generating forecasts for store: {store}")
+        parquet_path = os.path.join(ds_dir, "data", f"preprocessed_{store}.parquet")
+        version_path = os.path.join(ds_dir, "data", f"preprocessed_{store}.version")
+        if not os.path.isfile(parquet_path) or not os.path.isfile(version_path):
+            raise FileNotFoundError(f"Missing preprocessing artifact(s) for store {store}")
+        with open(version_path, "r", encoding="utf-8") as version_handle:
+            feature_version_value = version_handle.read().strip()
+
         df_part = load_from_cache(
             artifacts_dir=ds_dir,
             store_filter=store
@@ -238,6 +352,12 @@ def main():
             
         # Save soft targets store partition
         output_file = os.path.join(output_dir, f"{args.exp_name}_{store}.pt")
+        provenance_path = output_file.replace(".pt", ".json")
+        if (os.path.exists(output_file) or os.path.exists(provenance_path)) and not args.overwrite:
+            raise FileExistsError(
+                f"Refusing to overwrite existing soft-target artifact: {output_file}. "
+                "Use a new --exp-name for a fresh cache, or pass --overwrite deliberately."
+            )
         t0 = time.time()
         print(f"Saving soft targets partition to: {output_file}")
         torch.save({
@@ -251,15 +371,19 @@ def main():
         provenance = {
             "exp_name": args.exp_name,
             "store": store,
-            "checkpoint_path": str(checkpoint_path_abs),
             "max_day": int(max_day),
             "batch_size": int(args.batch_size),
             "feature_version": int(FEATURE_VERSION),
+            "preprocessed_parquet_path": str(parquet_path),
+            "preprocessed_parquet_sha256": _sha256_file(parquet_path),
+            "feature_version_path": str(version_path),
+            "feature_version_value": feature_version_value,
+            "feature_version_sha256": _sha256_file(version_path),
             "tensor_shape": list(store_soft_targets.shape),
             "git_commit": get_git_commit_hash(),
             "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         }
-        provenance_path = output_file.replace(".pt", ".json")
+        provenance.update(common_provenance)
         print(f"Saving soft targets provenance to: {provenance_path}")
         with open(provenance_path, "w") as _pf:
             json.dump(provenance, _pf, indent=4)
