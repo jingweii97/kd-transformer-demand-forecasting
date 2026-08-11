@@ -373,6 +373,7 @@ def main():
             "store": store,
             "max_day": int(max_day),
             "batch_size": int(args.batch_size),
+            "chunk_size": int(chunk_size),
             "feature_version": int(FEATURE_VERSION),
             "preprocessed_parquet_path": str(parquet_path),
             "preprocessed_parquet_sha256": _sha256_file(parquet_path),

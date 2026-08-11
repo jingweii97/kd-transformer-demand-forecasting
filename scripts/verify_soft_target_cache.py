@@ -26,17 +26,73 @@ CAT_COLUMNS = [
 ]
 
 
-def _sample_positions(decoded_index, cache_tensor, local_group, count):
-    """Choose reproducible, finite forecast rows spanning the available origins."""
-    origins = decoded_index["time_idx_first_prediction"].to_numpy(dtype=np.int64)
-    valid = np.asarray(
-        [torch.isfinite(cache_tensor[local_group, int(origin)]).all().item() for origin in origins],
-        dtype=bool,
+def _generation_context_batch(
+    training_data,
+    frame,
+    generation_items,
+    target_item,
+    cache_tensor,
+    local_by_global,
+    group_encoder,
+    chunk_size,
+    batch_size,
+):
+    """Recreate the exact chunk and contiguous inference batch used by generation.
+
+    The generator emits predictions from batches of 256 windows.  Evaluating a
+    window by itself can select a different GPU kernel/reduction path, yielding
+    tiny but real floating-point differences.  This function preserves the
+    generator's item ordering, chunk membership, batch ordering and batch size.
+    """
+    item_index = int(np.flatnonzero(generation_items == target_item)[0])
+    chunk_start = (item_index // chunk_size) * chunk_size
+    chunk_items = generation_items[chunk_start: chunk_start + chunk_size]
+    chunk_frame = frame[frame["item_id"].astype(str).isin(chunk_items)].copy()
+    chunk_dataset = TimeSeriesDataSet.from_dataset(
+        training_data, chunk_frame, predict=False, stop_randomization=True
     )
-    positions = np.flatnonzero(valid)
-    if len(positions) == 0:
-        return np.asarray([], dtype=np.int64)
-    return positions[np.linspace(0, len(positions) - 1, num=min(count, len(positions)), dtype=int)]
+    decoded = chunk_dataset.decoded_index.reset_index(drop=True)
+
+    target_series = str(frame.loc[frame["item_id"].astype(str) == target_item, "id"].iloc[0])
+    global_code = int(group_encoder.transform([target_series])[0])
+    if global_code not in local_by_global:
+        raise KeyError(f"Cache has no row for {target_series}")
+    local_group = local_by_global[global_code]
+    candidate_positions = np.flatnonzero(decoded["id"].astype(str).to_numpy() == target_series)
+    if len(candidate_positions) == 0:
+        raise ValueError(f"Generation chunk has no rows for {target_series}")
+
+    for position in candidate_positions:
+        origin = int(decoded.iloc[int(position)]["time_idx_first_prediction"])
+        if torch.isfinite(cache_tensor[local_group, origin]).all():
+            target_position = int(position)
+            break
+    else:
+        raise ValueError(f"Cache has no finite target for {target_series}")
+
+    batch_start = (target_position // batch_size) * batch_size
+    batch_indices = list(range(batch_start, min(batch_start + batch_size, len(chunk_dataset))))
+    base_loader = chunk_dataset.to_dataloader(
+        train=False, batch_size=batch_size, shuffle=False, num_workers=0
+    )
+    context_loader = DataLoader(
+        Subset(chunk_dataset, batch_indices),
+        batch_size=len(batch_indices),
+        shuffle=False,
+        num_workers=0,
+        collate_fn=base_loader.collate_fn,
+    )
+    x, _ = next(iter(context_loader))
+    return {
+        "x": x,
+        "series_id": target_series,
+        "global_code": global_code,
+        "cache_local_row": local_group,
+        "origin": int(decoded.iloc[target_position]["time_idx_first_prediction"]),
+        "batch_offset": target_position - batch_start,
+        "batch_size": len(batch_indices),
+        "chunk_index": chunk_start // chunk_size,
+    }
 
 
 def main():
@@ -47,6 +103,7 @@ def main():
     parser.add_argument("--checkpoint-path", required=True)
     parser.add_argument("--soft-targets-dir", default="artifacts/soft_targets")
     parser.add_argument("--samples-per-store", type=int, default=3)
+    parser.add_argument("--generation-chunk-size", type=int, default=500)
     parser.add_argument("--atol", type=float, default=1e-4)
     parser.add_argument("--rtol", type=float, default=1e-5)
     args = parser.parse_args()
@@ -90,52 +147,49 @@ def main():
             if column in frame:
                 frame[column] = frame[column].astype(str).astype("category")
 
-        items = sorted(frame["item_id"].astype(str).unique())
+        # Preserve the generator's original order. It chunks this array directly.
+        items = frame["item_id"].astype(str).unique()
         item_positions = np.linspace(0, len(items) - 1, num=min(args.samples_per_store, len(items)), dtype=int)
+        generation_batch_size = int(provenance["batch_size"])
+        generation_chunk_size = int(provenance.get("chunk_size", args.generation_chunk_size))
         for item_position in item_positions:
             item = items[item_position]
-            item_frame = frame[frame["item_id"].astype(str) == item].copy()
-            item_dataset = TimeSeriesDataSet.from_dataset(
-                training_data, item_frame, predict=False, stop_randomization=True
+            context = _generation_context_batch(
+                training_data=training_data,
+                frame=frame,
+                generation_items=items,
+                target_item=item,
+                cache_tensor=cache_tensor,
+                local_by_global=local_by_global,
+                group_encoder=group_encoder,
+                chunk_size=generation_chunk_size,
+                batch_size=generation_batch_size,
             )
-            decoded = item_dataset.decoded_index.reset_index(drop=True)
-            series_id = str(decoded.iloc[0]["id"])
-            global_code = int(group_encoder.transform([series_id])[0])
-            if global_code not in local_by_global:
-                raise KeyError(f"Cache has no row for {series_id} in {store}")
-            local_group = local_by_global[global_code]
-            positions = _sample_positions(decoded, cache_tensor, local_group, 1)
-            if len(positions) == 0:
-                raise ValueError(f"Cache has no finite target for {series_id} in {store}")
-
-            base_loader = item_dataset.to_dataloader(train=False, batch_size=1, shuffle=False, num_workers=0)
-            loader = DataLoader(
-                Subset(item_dataset, positions.tolist()),
-                batch_size=len(positions),
-                shuffle=False,
-                num_workers=0,
-                collate_fn=base_loader.collate_fn,
-            )
-            x, _ = next(iter(loader))
-            x_device = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in x.items()}
+            x_device = {
+                key: value.to(device) if isinstance(value, torch.Tensor) else value
+                for key, value in context["x"].items()
+            }
             with torch.no_grad():
                 fresh = teacher.to_prediction(teacher(x_device)).detach().cpu()
             if fresh.ndim == 3 and fresh.shape[-1] == 1:
                 fresh = fresh[..., 0]
 
-            origin = int(decoded.iloc[int(positions[0])]["time_idx_first_prediction"])
-            target = cache_tensor[local_group, origin]
-            difference = (fresh[0] - target).abs()
+            target = cache_tensor[context["cache_local_row"], context["origin"]]
+            prediction = fresh[context["batch_offset"]]
+            difference = (prediction - target).abs()
             result = {
                 "store": store,
-                "series_id": series_id,
-                "global_code": global_code,
-                "cache_local_row": local_group,
-                "origin": origin,
+                "series_id": context["series_id"],
+                "global_code": context["global_code"],
+                "cache_local_row": context["cache_local_row"],
+                "origin": context["origin"],
                 "horizon": int(target.shape[-1]),
+                "generation_chunk_index": context["chunk_index"],
+                "generation_batch_size": context["batch_size"],
+                "generation_batch_offset": context["batch_offset"],
                 "mean_abs_diff": float(difference.mean()),
                 "max_abs_diff": float(difference.max()),
-                "allclose": bool(torch.allclose(fresh[0], target, rtol=args.rtol, atol=args.atol)),
+                "allclose": bool(torch.allclose(prediction, target, rtol=args.rtol, atol=args.atol)),
             }
             results.append(result)
             print(json.dumps(result, sort_keys=True))
