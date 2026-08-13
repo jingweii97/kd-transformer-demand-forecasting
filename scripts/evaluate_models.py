@@ -823,6 +823,12 @@ def main():
     parser.add_argument("--teacher-checkpoint", type=str, default=None)
     parser.add_argument("--student-nokd-checkpoint", type=str, default=None)
     parser.add_argument("--student-kd-checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--selected-student-label",
+        type=str,
+        default="Student With KD",
+        help="Display label for the third student checkpoint; does not alter evaluation logic.",
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     args = parser.parse_args()
 
@@ -864,7 +870,7 @@ def main():
     print("\nResolved checkpoints:")
     print(f"Teacher: {teacher_chk}")
     print(f"Student (No KD): {student_nokd_chk}")
-    print(f"Student (KD): {student_kd_chk}")
+    print(f"Selected student ({args.selected_student_label}): {student_kd_chk}")
 
     df = load_dataset_from_cache(artifacts_dir=ds_dir, store_filter=cfg.environment.store_filter)
     
@@ -910,7 +916,7 @@ def main():
         ("Seasonal Naive", None, False),
         ("TFT Teacher", teacher, True),
         ("Student Without KD", student_nokd, False),
-        ("Student With KD", student_kd, False),
+        (args.selected_student_label, student_kd, False),
     ]
     bench_results = benchmark_inference(benchmark_models_info, _bench_batch_x, device)
     bench_csv = os.path.join(
@@ -976,7 +982,7 @@ def main():
         "series_count": FULL_M5_SERIES_COUNT,
     }
 
-    expected_models = {"Seasonal Naive", "TFT Teacher", "Student Without KD", "Student With KD"}
+    expected_models = {"Seasonal Naive", "TFT Teacher", "Student Without KD", args.selected_student_label}
     expected_horizons = {"Overall (1-28)", "Short (1-7)", "Medium (8-14)", "Long (15-28)"}
     expected_pairs = {(m, h) for m in expected_models for h in expected_horizons}
 
@@ -1021,7 +1027,7 @@ def main():
     models_eval = [
         ("TFT Teacher", teacher),
         ("Student Without KD", student_nokd),
-        ("Student With KD", student_kd)
+        (args.selected_student_label, student_kd)
     ]
     
 
@@ -1249,7 +1255,11 @@ def main():
             "checkpoints": {
                 "teacher": {"path": teacher_chk, "sha256": teacher_hash},
                 "student_nokd": {"path": student_nokd_chk, "sha256": student_nokd_hash},
-                "student_kd": {"path": student_kd_chk, "sha256": student_kd_hash}
+                "selected_student": {
+                    "path": student_kd_chk,
+                    "sha256": student_kd_hash,
+                    "label": args.selected_student_label,
+                }
             },
             "wrmsse_scale_diagnostics": scale_diag
         }
