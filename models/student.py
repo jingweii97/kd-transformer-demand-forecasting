@@ -5,8 +5,8 @@ import lightning.pytorch as pl
 class M5TransformerStudent(pl.LightningModule):
     def __init__(self, training_dataset, d_model=32, nhead=4, num_layers=2, dim_feedforward=64, 
                  dropout=0.1, lr=1e-3, alpha=1.0, lookback_window=90, prediction_window=28, 
-                 soft_targets=None, embedding_dim=8, output_head="flat_decoder_mlp", 
-                 output_head_hidden_dim=48):
+                 soft_targets=None, embedding_dim=8, output_head="flat_decoder_mlp",
+                 output_head_hidden_dim=48, supervised_loss="huber"):
         """
         training_dataset: TimeSeriesDataSet used for shape configurations and encoders
         d_model: Transformer hidden dimension size
@@ -15,7 +15,7 @@ class M5TransformerStudent(pl.LightningModule):
         dim_feedforward: Feed-forward network dimension in Transformer layers
         dropout: Dropout rate
         lr: Learning rate
-        alpha: Distillation weight (1.0 = purely supervised, 0.0 = purely distillation)
+        alpha: Supervised-loss weight (1.0 = purely supervised, 0.0 = purely distillation)
         lookback_window: L (number of lookback days)
         prediction_window: H (number of forecast days)
         soft_targets: Pre-computed teacher forecasts tensor of shape (num_groups, 1942, 28)
@@ -29,6 +29,12 @@ class M5TransformerStudent(pl.LightningModule):
         self.alpha = alpha
         self.lookback_window = lookback_window
         self.prediction_window = prediction_window
+        if supervised_loss not in {"huber", "wrmsse_informed"}:
+            raise ValueError(
+                "supervised_loss must be 'huber' or 'wrmsse_informed', got "
+                f"{supervised_loss!r}"
+            )
+        self.supervised_loss = supervised_loss
         
         # Store soft targets lookup tensor as a plain attribute to avoid saving it in checkpoints (6.6 GB)
         self.soft_targets = soft_targets
@@ -94,6 +100,45 @@ class M5TransformerStudent(pl.LightningModule):
         # Huber Loss (Smooth L1) for robustness
         self.loss_fn = nn.HuberLoss()
 
+    def _point_loss(self, predictions, targets, coefficients=None, decoder_lengths=None):
+        """Return the selected point objective reduced over batch and horizon.
+
+        For ``wrmsse_informed`` the fixed per-series coefficient is broadcast
+        over the 28 decoder steps.  This matches the teacher's
+        ``WRMSSEInformedLossMetric`` semantics: coefficient times squared error,
+        with no per-batch coefficient renormalization.  When decoder lengths
+        are supplied, its numerator and denominator follow
+        ``MultiHorizonMetric``: only valid decoder positions contribute.
+        """
+        if self.supervised_loss == "huber":
+            return self.loss_fn(predictions, targets)
+
+        if coefficients is None:
+            raise RuntimeError(
+                "WRMSSE-informed student loss requires per-series coefficients in every batch"
+            )
+        if coefficients.ndim != 1 or coefficients.shape[0] != predictions.shape[0]:
+            raise ValueError(
+                "WRMSSE-informed coefficient shape must be [batch]; got "
+                f"{tuple(coefficients.shape)} for predictions {tuple(predictions.shape)}"
+            )
+        if not torch.isfinite(coefficients).all() or (coefficients < 0).any():
+            raise ValueError("WRMSSE-informed coefficients must be finite and non-negative")
+        weighted_error = torch.square(predictions - targets) * coefficients.unsqueeze(1)
+        if decoder_lengths is None:
+            return weighted_error.mean()
+        if decoder_lengths.ndim != 1 or decoder_lengths.shape[0] != predictions.shape[0]:
+            raise ValueError(
+                "decoder_lengths must have shape [batch] when supplied; got "
+                f"{tuple(decoder_lengths.shape)}"
+            )
+        if (decoder_lengths < 1).any() or (decoder_lengths > predictions.shape[1]).any():
+            raise ValueError("decoder_lengths contains an invalid decoder horizon")
+        valid = torch.arange(
+            predictions.shape[1], device=predictions.device
+        ).unsqueeze(0) < decoder_lengths.unsqueeze(1)
+        return (weighted_error * valid).sum() / valid.sum()
+
     def forward(self, x):
         # x is batch[0] dict from PyTorch Forecasting dataloader
         batch_size = x['encoder_cat'].shape[0]
@@ -146,6 +191,8 @@ class M5TransformerStudent(pl.LightningModule):
         if isinstance(y, (tuple, list)):
             y = y[0]
         preds = self(x)
+        coefficients = x.get("wrmsse_informed_coefficient")
+        decoder_lengths = x.get("decoder_lengths")
         
         # y shape: (batch_size, prediction_window)
         teacher_preds = x.get('soft_targets', None)
@@ -165,15 +212,15 @@ class M5TransformerStudent(pl.LightningModule):
                 raise RuntimeError("Missing or NaN teacher targets encountered in KD training batch. All eligible KD training samples must have complete teacher predictions.")
 
             # Compute losses
-            loss_sup = self.loss_fn(preds, y)
-            loss_dist = self.loss_fn(preds, teacher_preds)
+            loss_sup = self._point_loss(preds, y, coefficients, decoder_lengths)
+            loss_dist = self._point_loss(preds, teacher_preds, coefficients, decoder_lengths)
             
             loss = self.alpha * loss_sup + (1.0 - self.alpha) * loss_dist
             self.log("train_loss_sup", loss_sup, on_step=False, on_epoch=True, prog_bar=True)
             self.log("train_loss_dist", loss_dist, on_step=False, on_epoch=True, prog_bar=True)
         else:
             # Supervised mode (Ablation Student without KD)
-            loss = self.loss_fn(preds, y)
+            loss = self._point_loss(preds, y, coefficients, decoder_lengths)
             
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
@@ -183,9 +230,11 @@ class M5TransformerStudent(pl.LightningModule):
         if isinstance(y, (tuple, list)):
             y = y[0]
         preds = self(x)
+        coefficients = x.get("wrmsse_informed_coefficient")
+        decoder_lengths = x.get("decoder_lengths")
         
         # Validation is evaluated purely on ground-truth target
-        loss = self.loss_fn(preds, y)
+        loss = self._point_loss(preds, y, coefficients, decoder_lengths)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 

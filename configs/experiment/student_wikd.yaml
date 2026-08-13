@@ -1,0 +1,17 @@
+# Student-WIKD: shared WRMSSE-informed supervision and response distillation.
+store_filter: ""
+window_stride: 7
+
+student:
+  epochs: 50
+  patience: 5
+  kd: true
+  alpha: 0.5
+  supervised_loss: "wrmsse_informed"
+  wrmsse_weight_days: 28
+  wrmsse_scale_floor_quantile: 0.01
+  wrmsse_epsilon: 1.0e-8
+  wrmsse_pretraining_audit_approved: true
+  save_top_k: 5
+  checkpoint_filename: "student-wikd-epoch={epoch:02d}-val_loss={val_loss:.6f}"
+  checkpoint_auto_insert_metric_name: false

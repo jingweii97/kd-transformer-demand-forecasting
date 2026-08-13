@@ -56,13 +56,22 @@ def _window_count(
     return int(np.count_nonzero(starts % stride == 0)) if stride > 1 else len(starts)
 
 
-def build_wrmsse_informed_coefficients(cfg) -> WRMSSEInformedCoefficients:
-    """Compute fixed bottom-level coefficients using rows at or before train_end only."""
+def build_wrmsse_informed_coefficients(
+    cfg, objective_config=None
+) -> WRMSSEInformedCoefficients:
+    """Compute fixed bottom-level coefficients using rows at or before train_end only.
+
+    ``objective_config`` may be the teacher or student configuration section.
+    The coefficient formula is deliberately shared: it uses the same training
+    boundary, economic-weight window, RMSSE stabilization, and window-frequency
+    normalization whichever point model consumes the coefficients.
+    """
+    objective_config = objective_config if objective_config is not None else cfg.teacher
     train_end = int(cfg.dataset.splits.train.end)
     train_start = int(cfg.dataset.splits.train.start)
-    weight_days = int(getattr(cfg.teacher, "wrmsse_weight_days", 28))
-    floor_quantile = float(getattr(cfg.teacher, "wrmsse_scale_floor_quantile", 0.01))
-    epsilon = float(getattr(cfg.teacher, "wrmsse_epsilon", 1e-8))
+    weight_days = int(getattr(objective_config, "wrmsse_weight_days", 28))
+    floor_quantile = float(getattr(objective_config, "wrmsse_scale_floor_quantile", 0.01))
+    epsilon = float(getattr(objective_config, "wrmsse_epsilon", 1e-8))
     stride = int(getattr(cfg.dataset, "window_stride", 1))
     encoder_length = int(cfg.dataset.lookback_window)
     prediction_length = int(cfg.dataset.prediction_window)

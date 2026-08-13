@@ -15,6 +15,7 @@ from utils.logging import get_csv_logger
 from data.cache import resolve_stores, is_cache_valid
 from data.dataset import build_timeseries_dataset
 from models.student import M5TransformerStudent
+from models.wrmsse_informed import build_wrmsse_informed_coefficients
 import torch
 
 class EpochMetricsLoggingCallback(pl.Callback):
@@ -58,8 +59,20 @@ def main():
     parser.set_defaults(kd=None) # Use config setting if not specified on CLI
     
     parser.add_argument("--alpha", type=float, default=None, help="Supervised loss weight (1-alpha is distillation loss weight)")
+    parser.add_argument(
+        "--supervised-loss",
+        choices=["huber", "wrmsse_informed"],
+        default=None,
+        help="Point objective for ground-truth supervision; defaults to config student.supervised_loss.",
+    )
     parser.add_argument("--soft-targets-path", type=str, default=None, 
                         help="Path to the pre-computed teacher soft targets tensor (.pt file)")
+    parser.add_argument(
+        "--soft-targets-exp-name",
+        type=str,
+        default=None,
+        help="Cache filename prefix for per-store soft targets; defaults to --exp-name.",
+    )
     parser.add_argument("--epochs", type=int, default=None, help="Override training epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
     parser.add_argument("--limit-train-batches", type=float, default=None, help="Limit train batches per epoch")
@@ -93,7 +106,18 @@ def main():
     cfg.student.kd = kd_enabled
     
     alpha = args.alpha if args.alpha is not None else cfg.student.alpha
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError(f"alpha must be in [0, 1], got {alpha}")
     cfg.student.alpha = alpha
+
+    supervised_loss = (
+        args.supervised_loss
+        if args.supervised_loss is not None
+        else getattr(cfg.student, "supervised_loss", "huber")
+    )
+    cfg.student.supervised_loss = supervised_loss
+    soft_target_exp_name = args.soft_targets_exp_name or args.exp_name
+    cfg.student.soft_targets_exp_name = soft_target_exp_name
     
     epochs = args.epochs if args.epochs is not None else cfg.student.epochs
     cfg.student.epochs = epochs
@@ -121,9 +145,38 @@ def main():
     # 3. Build Datasets
     print("Building TimeSeriesDataSet objects...")
     training_data = build_timeseries_dataset(None, cfg, is_train=True)
-    
+
     from data.dataset import StorePartitionManager
-    partition_manager = StorePartitionManager(training_data, cfg, exp_name=args.exp_name)
+    wrmsse_coefficients = None
+    wrmsse_coefficient_audit = None
+    if supervised_loss == "wrmsse_informed":
+        coefficient_bundle = build_wrmsse_informed_coefficients(
+            cfg, objective_config=cfg.student
+        )
+        if coefficient_bundle.audit["pathological"]:
+            raise RuntimeError(
+                "WRMSSE-informed coefficient distribution is pathological: "
+                + "; ".join(coefficient_bundle.audit["pathological_reasons"])
+            )
+        if not getattr(cfg.student, "wrmsse_pretraining_audit_approved", False):
+            raise RuntimeError(
+                "WRMSSE-informed student training is gated until its shared coefficient "
+                "audit is explicitly approved by setting "
+                "student.wrmsse_pretraining_audit_approved=true."
+            )
+        wrmsse_coefficients = coefficient_bundle.by_series
+        wrmsse_coefficient_audit = coefficient_bundle.audit
+        print(
+            "Using shared training-only WRMSSE-informed coefficients for "
+            f"{len(wrmsse_coefficients):,} bottom-level series."
+        )
+
+    partition_manager = StorePartitionManager(
+        training_data,
+        cfg,
+        exp_name=args.exp_name,
+        series_coefficients=wrmsse_coefficients,
+    )
 
     # 4. Create DataLoaders via Partition Manager
     train_loader = partition_manager.train_dataloader(batch_size=batch_size)
@@ -147,13 +200,13 @@ def main():
                 stores_to_check = resolve_stores(cfg.environment.store_filter)
                 missing_stores = []
                 for store in stores_to_check:
-                    p = os.path.join(resolved_p, f"{args.exp_name}_{store}.pt")
+                    p = os.path.join(resolved_p, f"{soft_target_exp_name}_{store}.pt")
                     if not os.path.exists(p):
-                        missing_stores.append(f"{args.exp_name}_{store}.pt")
+                        missing_stores.append(f"{soft_target_exp_name}_{store}.pt")
                 if missing_stores:
                     raise FileNotFoundError(
                         f"Soft targets directory '{resolved_p}' is missing the following expected "
-                        f"per-store file(s) for experiment '{args.exp_name}': {', '.join(missing_stores)}. "
+                        f"per-store file(s) for cache prefix '{soft_target_exp_name}': {', '.join(missing_stores)}. "
                         f"Expected files for all streamed stores under this experiment."
                     )
                 use_per_store_targets = True
@@ -182,7 +235,7 @@ def main():
             resolved_dir = None
             for store in STORES:
                 for d in check_dirs:
-                    p = os.path.join(d, f"{args.exp_name}_{store}.pt")
+                    p = os.path.join(d, f"{soft_target_exp_name}_{store}.pt")
                     if os.path.exists(p):
                         use_per_store_targets = True
                         resolved_dir = d
@@ -193,7 +246,7 @@ def main():
                 cfg.student.soft_targets_path = resolved_dir
 
         if use_per_store_targets:
-            print(f"Per-store soft targets detected for experiment '{args.exp_name}'. Dataloader will stream them partition-by-partition.")
+            print(f"Per-store soft targets detected for cache prefix '{soft_target_exp_name}'. Dataloader will stream them partition-by-partition.")
         else:
             # Fallback/Default path for loading legacy global soft targets tensor
             if not soft_targets_path:
@@ -201,19 +254,19 @@ def main():
                 if exp_dir is not None:
                     from utils.paths import get_experiment_dir
                     exp_art_dir = get_experiment_dir(cfg)
-                    path1 = os.path.join(exp_art_dir, "soft_targets", f"{args.exp_name}.pt")
-                    path2 = os.path.join(exp_art_dir, "outputs", "soft_targets", f"{args.exp_name}.pt")
+                    path1 = os.path.join(exp_art_dir, "soft_targets", f"{soft_target_exp_name}.pt")
+                    path2 = os.path.join(exp_art_dir, "outputs", "soft_targets", f"{soft_target_exp_name}.pt")
                     if os.path.exists(path1):
                         soft_targets_path = path1
                     elif os.path.exists(path2):
                         soft_targets_path = path2
                     else:
                         raise FileNotFoundError(
-                            f"Soft targets file for '{args.exp_name}' not found under configured experiment_artifacts_dir at '{exp_art_dir}'"
+                            f"Soft targets file for '{soft_target_exp_name}' not found under configured experiment_artifacts_dir at '{exp_art_dir}'"
                         )
                 else:
                     artifacts_dir = resolve_path(cfg.environment.artifacts_dir)
-                    soft_targets_path = os.path.join(artifacts_dir, "soft_targets", f"{args.exp_name}.pt")
+                    soft_targets_path = os.path.join(artifacts_dir, "soft_targets", f"{soft_target_exp_name}.pt")
             
             soft_targets_path_abs = resolve_path(soft_targets_path)
             print(f"Loading legacy global teacher forecasts from: {soft_targets_path_abs}")
@@ -254,7 +307,8 @@ def main():
         alpha=alpha if kd_enabled else 1.0,
         lookback_window=cfg.dataset.lookback_window,
         prediction_window=cfg.dataset.prediction_window,
-        soft_targets=soft_targets
+        soft_targets=soft_targets,
+        supervised_loss=supervised_loss,
     )
 
     # 7. Set up Logs and Outputs
@@ -289,10 +343,13 @@ def main():
     checkpoint_callback = ModelCheckpoint(
         dirpath=exp_dir,
         monitor="val_loss",
-        filename="best_student",
-        save_top_k=1,
+        filename=getattr(cfg.student, "checkpoint_filename", "best_student"),
+        save_top_k=int(getattr(cfg.student, "save_top_k", 1)),
         save_last=True,
-        mode="min"
+        mode="min",
+        auto_insert_metric_name=getattr(
+            cfg.student, "checkpoint_auto_insert_metric_name", True
+        ),
     )
     
     early_stop_callback = EarlyStopping(
@@ -338,7 +395,12 @@ def main():
         checkpoint_path=best_path,
         additional_fields={
             "kd_enabled": kd_enabled,
-            "alpha": float(alpha)
+            "alpha": float(model.alpha),
+            "requested_alpha": float(alpha),
+            "supervised_loss": supervised_loss,
+            "checkpoint_monitor": "val_loss",
+            "checkpoint_save_top_k": int(getattr(cfg.student, "save_top_k", 1)),
+            "wrmsse_coefficient_audit": wrmsse_coefficient_audit,
         }
     )
 
