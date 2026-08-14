@@ -1,10 +1,11 @@
 #!/bin/bash -l
 # Deterministic pre-launch audit; creates a new v2 audit artifact only.
-#SBATCH --partition=cpu
+#SBATCH --partition=gpu-a100
 #SBATCH --job-name=phase_v2_sampler_audit
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
+#SBATCH --gpus=1
 #SBATCH --mem=4G
 #SBATCH --qos=short
 #SBATCH --output=logs/slurm/phase_v2_sampler_audit_%j.out
