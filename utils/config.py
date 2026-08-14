@@ -88,6 +88,8 @@ def load_config(env_name="local", experiment_name=None, config_dir="configs"):
             merged_dict["environment"]["store_filter"] = exp_cfg["store_filter"]
         if "window_stride" in exp_cfg:
             merged_dict["dataset"]["window_stride"] = exp_cfg["window_stride"]
+        if "dataset" in exp_cfg and isinstance(exp_cfg["dataset"], dict):
+            merged_dict["dataset"].update(exp_cfg["dataset"])
         if "teacher" in exp_cfg and isinstance(exp_cfg["teacher"], dict):
             merged_dict["teacher"].update(exp_cfg["teacher"])
         if "student" in exp_cfg and isinstance(exp_cfg["student"], dict):
@@ -212,4 +214,3 @@ def save_metadata(output_dir, seed, checkpoint_path=None, metrics=None, addition
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=4)
     print(f"Saved experiment metadata to {metadata_path}")
-

@@ -1,0 +1,25 @@
+# Phase-WIS v2: architecture unchanged; deterministic all-phase origin schedule.
+store_filter: ""
+
+dataset:
+  training_origin_sampling:
+    mode: "explicit_list"
+    origins_file: "configs/origins/phase_balanced_v2.json"
+  validation_origin_sampling:
+    mode: "explicit_list"
+    origins_file: "configs/origins/phase_balanced_validation_v2.json"
+
+student:
+  epochs: 50
+  patience: 5
+  enable_early_stopping: false
+  kd: false
+  alpha: 1.0
+  supervised_loss: "wrmsse_informed"
+  wrmsse_weight_days: 28
+  wrmsse_scale_floor_quantile: 0.01
+  wrmsse_epsilon: 1.0e-8
+  wrmsse_pretraining_audit_approved: true
+  save_top_k: -1
+  checkpoint_filename: "phase-wis-v2-epoch={epoch:02d}-val_loss={val_loss:.6f}"
+  checkpoint_auto_insert_metric_name: false

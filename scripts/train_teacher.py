@@ -189,7 +189,12 @@ def main():
 
     enable_progress_bar = True
     obs_callback = ObservabilityCallback()
-    callbacks = [early_stop_callback, checkpoint_callback, obs_callback]
+    # Phase-balanced experiments select later on all seven validation phases.
+    # They retain every epoch and must not terminate based on the legacy Friday-only
+    # validation loss.  Preserve the historical default for every other experiment.
+    callbacks = [checkpoint_callback, obs_callback]
+    if getattr(cfg.teacher, "enable_early_stopping", True):
+        callbacks.insert(0, early_stop_callback)
     if args.env == "kaggle":
         enable_progress_bar = False
         callbacks.append(EpochMetricsLoggingCallback())

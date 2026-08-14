@@ -8,6 +8,8 @@ import pickle
 import pandas as pd
 import numpy as np
 from utils.paths import resolve_path
+from utils.paths import get_repo_root
+from data.origin_sampling import load_training_origins
 from data.cache import load_from_cache, STORES, resolve_stores
 import torch
 
@@ -50,6 +52,25 @@ class StorePartitionedDataset(IterableDataset):
             
         max_encoder_length = self.cfg.dataset.lookback_window
         max_prediction_length = self.cfg.dataset.prediction_window
+        explicit_validation_origins = None
+        if not self.is_train:
+            # Phase-balanced v2 validation uses one full panel from each of the
+            # seven scheduled forecast starts. Legacy experiments keep the
+            # single-origin predict=True validation behaviour.
+            explicit_validation_origins = load_training_origins(
+                getattr(self.cfg.dataset, "validation_origin_sampling", None),
+                repo_root=get_repo_root(),
+            )
+            if explicit_validation_origins is not None:
+                if self.max_idx is None:
+                    raise ValueError("Explicit validation origins require max_idx")
+                if (
+                    explicit_validation_origins[0] - max_encoder_length < 1
+                    or explicit_validation_origins[-1] + max_prediction_length - 1 > self.max_idx
+                ):
+                    raise ValueError(
+                        "Explicit validation origins are outside the validation loader range"
+                    )
         
         decoded_indices = []
             
@@ -107,8 +128,12 @@ class StorePartitionedDataset(IterableDataset):
             if self.is_train:
                 df_part_sliced = df_part[df_part['time_idx'] <= train_end].copy()
             else:
-                # Slicing evaluation window: lookback + prediction ending at max_idx
-                min_idx = self.max_idx - max_encoder_length - max_prediction_length + 1
+                # Retain the history required by the earliest scheduled phase.
+                min_idx = (
+                    explicit_validation_origins[0] - max_encoder_length
+                    if explicit_validation_origins is not None
+                    else self.max_idx - max_encoder_length - max_prediction_length + 1
+                )
                 df_part_sliced = df_part[(df_part['time_idx'] >= min_idx) & (df_part['time_idx'] <= self.max_idx)].copy()
                 
             del df_part
@@ -136,26 +161,58 @@ class StorePartitionedDataset(IterableDataset):
                 dataset_kwargs = {"weight": "wrmsse_informed_coefficient"} if use_wrmsse_weights else {}
                 part_ds = TimeSeriesDataSet.from_dataset(self.base_dataset, df_part_sliced, **dataset_kwargs)
                 
-                # Apply configurable window stride (training only).
+                # Apply an explicit controlled schedule when configured. This
+                # is used by phase-balanced v2; otherwise preserve the legacy
+                # modulo-stride behaviour exactly.
                 # Uses the official filter() API on time_idx_first_prediction — the decoder
                 # start time index exposed by decoded_index — so subsampling is aligned to
                 # consistent calendar positions across all series rather than arbitrary row
                 # offsets.  stride=1 is a no-op (all windows retained).
-                stride = getattr(self.cfg.dataset, "window_stride", 1)
-                if stride > 1:
-                    time_col = "time_idx_first_prediction"
+                explicit_origins = load_training_origins(
+                    getattr(self.cfg.dataset, "training_origin_sampling", None),
+                    repo_root=get_repo_root(),
+                )
+                if explicit_origins is not None:
+                    allowed = set(explicit_origins)
                     part_ds = part_ds.filter(
-                        lambda idx: idx[time_col] % stride == 0
+                        lambda idx: idx["time_idx_first_prediction"].isin(allowed)
                     )
+                    observed = sorted(part_ds.decoded_index["time_idx_first_prediction"].unique().tolist())
+                    if observed != explicit_origins:
+                        raise AssertionError(
+                            "Explicit training origins were not realized exactly; "
+                            f"expected={explicit_origins[:3]}...{explicit_origins[-3:]}, "
+                            f"observed={observed[:3]}...{observed[-3:]}"
+                        )
+                else:
+                    stride = getattr(self.cfg.dataset, "window_stride", 1)
+                    if stride > 1:
+                        time_col = "time_idx_first_prediction"
+                        part_ds = part_ds.filter(
+                            lambda idx: idx[time_col] % stride == 0
+                        )
 
             else:
                 part_ds = TimeSeriesDataSet.from_dataset(
                     self.base_dataset,
                     df_part_sliced,
-                    predict=self.predict,
+                    predict=False if explicit_validation_origins is not None else self.predict,
                     stop_randomization=True,
                     **({"weight": "wrmsse_informed_coefficient"} if use_wrmsse_weights else {})
                 )
+                if explicit_validation_origins is not None:
+                    allowed = set(explicit_validation_origins)
+                    part_ds = part_ds.filter(
+                        lambda idx: idx["time_idx_first_prediction"].isin(allowed)
+                    )
+                    observed = sorted(
+                        part_ds.decoded_index["time_idx_first_prediction"].unique().tolist()
+                    )
+                    if observed != explicit_validation_origins:
+                        raise AssertionError(
+                            "Explicit validation origins were not realized exactly; "
+                            f"expected={explicit_validation_origins}, observed={observed}"
+                        )
             del df_part_sliced
             
             # Collect decoded index metadata

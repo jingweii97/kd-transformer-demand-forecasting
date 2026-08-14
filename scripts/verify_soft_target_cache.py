@@ -104,6 +104,7 @@ def main():
     parser.add_argument("--soft-targets-dir", default="artifacts/soft_targets")
     parser.add_argument("--samples-per-store", type=int, default=3)
     parser.add_argument("--generation-chunk-size", type=int, default=500)
+    parser.add_argument("--origins-file", default=None)
     parser.add_argument("--atol", type=float, default=1e-4)
     parser.add_argument("--rtol", type=float, default=1e-5)
     args = parser.parse_args()
@@ -113,6 +114,12 @@ def main():
     checkpoint_path = resolve_path(args.checkpoint_path)
     targets_dir = resolve_path(args.soft_targets_dir)
     checkpoint_sha256 = _sha256_file(checkpoint_path)
+    requested_origins = None
+    if args.origins_file:
+        with open(resolve_path(args.origins_file), "r", encoding="utf-8") as handle:
+            requested_origins = json.load(handle).get("origins")
+        if not isinstance(requested_origins, list) or not requested_origins:
+            raise ValueError("--origins-file must contain a non-empty 'origins' list")
 
     training_data = build_timeseries_dataset(None, cfg, is_train=True)
     teacher = TemporalFusionTransformer.load_from_checkpoint(checkpoint_path).eval()
@@ -140,6 +147,12 @@ def main():
         cache_tensor = cached["tensor"]
         local_by_global = {int(code): index for index, code in enumerate(cached["unique_groups"])}
         max_day = int(provenance["max_day"])
+        if requested_origins is not None:
+            if provenance.get("requested_origins") != requested_origins:
+                raise ValueError(f"{store}: cache provenance does not match the requested origin schedule")
+            required = torch.tensor(requested_origins, dtype=torch.long)
+            if not torch.isfinite(cache_tensor[:, required]).all():
+                raise ValueError(f"{store}: cache has missing/non-finite predictions for requested origins")
 
         frame = load_from_cache(dataset_dir, store)
         frame = frame[(frame["time_idx"] >= 1) & (frame["time_idx"] <= max_day)].copy()

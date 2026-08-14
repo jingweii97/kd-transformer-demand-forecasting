@@ -235,7 +235,13 @@ class M5TransformerStudent(pl.LightningModule):
         
         # Validation is evaluated purely on ground-truth target
         loss = self._point_loss(preds, y, coefficients, decoder_lengths)
-        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        # The phase-v2 loader emits d1520..d1526. Batch-size weighting makes
+        # the epoch metric their ground-truth objective mean. KD soft targets
+        # are unavailable in validation and are intentionally never consulted.
+        self.log(
+            "val_loss", loss, on_step=False, on_epoch=True, prog_bar=True,
+            batch_size=preds.shape[0],
+        )
         return loss
 
     def configure_optimizers(self):

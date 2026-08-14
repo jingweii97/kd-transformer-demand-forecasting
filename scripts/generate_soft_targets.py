@@ -102,6 +102,11 @@ def main():
     parser.add_argument("--max-day", type=int, default=None, 
                         help="Limit inference day range for fast verification (default: end of Validation)")
     parser.add_argument(
+        "--origins-file",
+        default=None,
+        help="Optional JSON file containing an explicit {'origins': [...]} training-start schedule.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Allow replacement of an existing cache partition for this experiment name",
@@ -122,6 +127,21 @@ def main():
     # Determine default max day for soft target generation (training split end)
     train_end = cfg.dataset.splits.train.end
     max_day = args.max_day if args.max_day is not None else train_end
+    requested_origins = None
+    origins_file_abs = None
+    if args.origins_file:
+        origins_file_abs = resolve_path(args.origins_file)
+        with open(origins_file_abs, "r", encoding="utf-8") as handle:
+            requested_origins = json.load(handle).get("origins")
+        if (
+            not isinstance(requested_origins, list)
+            or not requested_origins
+            or not all(isinstance(origin, int) for origin in requested_origins)
+            or requested_origins != sorted(set(requested_origins))
+        ):
+            raise ValueError("--origins-file must contain a non-empty, sorted unique integer 'origins' list")
+        if requested_origins[0] < 1 or requested_origins[-1] + cfg.dataset.prediction_window - 1 > max_day:
+            raise ValueError("--max-day does not cover the full requested origin schedule and horizon")
 
     # Define output file path under artifacts/soft_targets/
     artifacts_dir = resolve_path(cfg.environment.artifacts_dir)
@@ -269,6 +289,16 @@ def main():
                 predict=False,  # sliding windows
                 stop_randomization=True
             )
+            if requested_origins is not None:
+                requested_set = set(requested_origins)
+                chunk_ds = chunk_ds.filter(
+                    lambda idx: idx["time_idx_first_prediction"].isin(requested_set)
+                )
+                realized = sorted(chunk_ds.decoded_index["time_idx_first_prediction"].unique().tolist())
+                if realized != requested_origins:
+                    raise AssertionError(
+                        f"{store} chunk {chunk_idx} did not realize the exact requested origins"
+                    )
             del df_chunk
             t_dataset = time.time() - t0
             print(f"Store {store} | Chunk {chunk_idx}/{num_chunks} | Building TimeSeriesDataSet completed in {t_dataset:.2f}s")
@@ -381,6 +411,10 @@ def main():
             "feature_version_value": feature_version_value,
             "feature_version_sha256": _sha256_file(version_path),
             "tensor_shape": list(store_soft_targets.shape),
+            "requested_origins_file": str(origins_file_abs) if origins_file_abs else None,
+            "requested_origins_sha256": _sha256_file(origins_file_abs) if origins_file_abs else None,
+            "requested_origin_count": len(requested_origins) if requested_origins else None,
+            "requested_origins": requested_origins,
             "git_commit": get_git_commit_hash(),
             "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         }

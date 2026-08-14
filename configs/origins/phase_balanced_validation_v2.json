@@ -1,0 +1,6 @@
+{
+  "name": "phase_balanced_validation_v2",
+  "description": "Seven consecutive, validation-only forecast starts. d1526 is the retained legacy Friday reference.",
+  "origins": [1520, 1521, 1522, 1523, 1524, 1525, 1526],
+  "reference_friday_origin": 1526
+}

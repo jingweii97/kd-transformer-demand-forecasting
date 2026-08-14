@@ -360,7 +360,12 @@ def main():
     )
 
     enable_progress_bar = True
-    callbacks = [early_stop_callback, checkpoint_callback]
+    # A phase-balanced run uses a common seven-origin post-training selection
+    # criterion, so do not stop it using its legacy Friday-only validation loss.
+    # Existing experiments retain the historical callback default.
+    callbacks = [checkpoint_callback]
+    if getattr(cfg.student, "enable_early_stopping", True):
+        callbacks.insert(0, early_stop_callback)
     if args.env == "kaggle":
         enable_progress_bar = False
         callbacks.append(EpochMetricsLoggingCallback())
