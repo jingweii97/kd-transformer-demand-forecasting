@@ -9,7 +9,8 @@ import numpy as np
 import pandas as pd
 
 from data.cache import get_cache_path, is_cache_valid, resolve_stores
-from utils.paths import get_dataset_dir
+from data.origin_sampling import load_training_origins
+from utils.paths import get_dataset_dir, get_repo_root
 from utils.wrmsse import (
     compute_rmsse_scale,
     economic_weight_numerators,
@@ -56,6 +57,15 @@ def _window_count(
     return int(np.count_nonzero(starts % stride == 0)) if stride > 1 else len(starts)
 
 
+def _explicit_origin_count(
+    origins: list[int],
+    first_prediction: int,
+    last_prediction: int,
+) -> int:
+    """Count exact configured forecast starts feasible for one series."""
+    return sum(first_prediction <= origin <= last_prediction for origin in origins)
+
+
 def build_wrmsse_informed_coefficients(
     cfg, objective_config=None
 ) -> WRMSSEInformedCoefficients:
@@ -72,6 +82,10 @@ def build_wrmsse_informed_coefficients(
     weight_days = int(getattr(objective_config, "wrmsse_weight_days", 28))
     floor_quantile = float(getattr(objective_config, "wrmsse_scale_floor_quantile", 0.01))
     epsilon = float(getattr(objective_config, "wrmsse_epsilon", 1e-8))
+    explicit_origins = load_training_origins(
+        getattr(cfg.dataset, "training_origin_sampling", None),
+        repo_root=get_repo_root(),
+    )
     stride = int(getattr(cfg.dataset, "window_stride", 1))
     encoder_length = int(cfg.dataset.lookback_window)
     prediction_length = int(cfg.dataset.prediction_window)
@@ -113,6 +127,19 @@ def build_wrmsse_informed_coefficients(
                 .to_numpy()
             )
             scale, reason = compute_rmsse_scale(sales)
+            first_prediction = train_start + encoder_length
+            last_prediction = last_time - prediction_length + 1
+            window_count = (
+                _explicit_origin_count(explicit_origins, first_prediction, last_prediction)
+                if explicit_origins is not None
+                else _window_count(
+                    train_start,
+                    last_time,
+                    encoder_length,
+                    prediction_length,
+                    stride,
+                )
+            )
             series_rows.append(
                 {
                     "id": str(series_id),
@@ -121,13 +148,7 @@ def build_wrmsse_informed_coefficients(
                     "history_observations": int(ordered["time_idx"].nunique()),
                     "first_time": first_time,
                     "last_time": last_time,
-                    "window_count": _window_count(
-                        train_start,
-                        last_time,
-                        encoder_length,
-                        prediction_length,
-                        stride,
-                    ),
+                    "window_count": window_count,
                 }
             )
         store_stats = pd.DataFrame(series_rows).merge(numerators, on="id", how="left")
@@ -219,6 +240,15 @@ def build_wrmsse_informed_coefficients(
         "unique_series_raw_mean": unique_mean,
         "window_mean_equals_unique_mean": bool(equal_windows and np.isclose(normalization, unique_mean)),
         "normalized_window_mean": float(np.dot(normalized, window_counts) / total_windows),
+        "window_count_source": (
+            "explicit_training_origin_sampling"
+            if explicit_origins is not None
+            else "legacy_window_stride"
+        ),
+        "explicit_training_origin_count": (
+            int(len(explicit_origins)) if explicit_origins is not None else None
+        ),
+        "legacy_window_stride": stride if explicit_origins is None else None,
         "pathological": bool(pathological_reasons),
         "pathological_reasons": pathological_reasons,
     }
